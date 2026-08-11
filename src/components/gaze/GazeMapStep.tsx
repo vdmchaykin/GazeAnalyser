@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Play, RefreshCw, CheckCircle2, PlayCircle, Trash2 } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
-import type { CalibrationPoint, GazeAnalysisState, RecordingMeta } from "@/types";
+import type { CalibrationPoint, GazeAnalysisState, GazeSource, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
 
@@ -15,15 +15,19 @@ interface ResidualRow {
 }
 
 interface MapResult {
-  mean_rmse: number;
+  // null for the cloud sources: no model is fitted, so there is no calibration error.
+  mean_rmse: number | null;
   frames_with_gaze: number;
   frames_on_paper: number;
   total_frames: number;
   residuals: ResidualRow[];
+  n_cloud_samples?: number;
+  resampled?: boolean;
 }
 
 interface Props {
   recording: RecordingMeta;
+  source: GazeSource;
   calibrationPoints: CalibrationPoint[];
   done: boolean;
   onDone: () => void;
@@ -31,11 +35,16 @@ interface Props {
   onOpenPlayer: (id: string) => void;
 }
 
-export function GazeMapStep({ recording, calibrationPoints, done: initialDone, onDone, onDeleted, onOpenPlayer }: Props) {
+export function GazeMapStep({ recording, source, calibrationPoints, done: initialDone, onDone, onDeleted, onOpenPlayer }: Props) {
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(initialDone);
   const [result, setResult] = useState<MapResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Pupil Cloud samples at ~200 Hz; our own pipeline predicts on a 30-fps grid.
+  // Resampling puts both on the same timestamps so the sources stay comparable.
+  const [resample, setResample] = useState(true);
+
+  const isCloud = source !== "own";
 
   // Load the last mapping's stats when arriving on an already-mapped recording.
   useEffect(() => {
@@ -58,7 +67,7 @@ export function GazeMapStep({ recording, calibrationPoints, done: initialDone, o
     setRunning(true);
     setError(null);
     try {
-      const res = await fetch(`${API}/api/recordings/${recording.id}/gaze/map`, {
+      const res = await fetch(`${API}/api/recordings/${recording.id}/gaze/map?resample_30fps=${resample}`, {
         method: "POST",
       });
       if (!res.ok) {
@@ -77,7 +86,11 @@ export function GazeMapStep({ recording, calibrationPoints, done: initialDone, o
   };
 
   const handleDelete = async () => {
-    if (!(await confirmDialog({ title: "Delete gaze mapping", message: "Delete gaze mapping results for this recording?" }))) return;
+    const message = isCloud
+      // Both cloud sources read the same projection, so it goes for both of them.
+      ? "Delete the mapped Pupil Cloud gaze (and the fixations derived from it) for this recording?"
+      : "Delete gaze mapping results for this recording?";
+    if (!(await confirmDialog({ title: "Delete gaze mapping", message }))) return;
     try {
       const res = await fetch(`${API}/api/recordings/${recording.id}/gaze/data/mapping`, { method: "DELETE" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -96,26 +109,54 @@ export function GazeMapStep({ recording, calibrationPoints, done: initialDone, o
   return (
     <div className="p-8 max-w-3xl mx-auto space-y-8">
       <div>
-        <h2 className="text-lg font-semibold text-white">Step 3 — Gaze Mapping</h2>
+        <h2 className="text-lg font-semibold text-white">
+          {isCloud ? "Step 3 — Map Gaze to Surface" : "Step 3 — Gaze Mapping"}
+        </h2>
         <p className="text-sm text-zinc-400 mt-1">
-          Train polynomial regression on calibration points and predict gaze for all frames.
-          
+          {isCloud
+            ? "Pupil Cloud's gaze already lives in scene-camera pixels, so no model is fitted here — "
+              + "it is only projected onto the paper surface with the AoI marker homography."
+            : "Train polynomial regression on calibration points and predict gaze for all frames."}
         </p>
       </div>
 
-      {/* Calibration summary */}
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-2">
-        <p className="text-xs text-zinc-500 uppercase tracking-wider">Calibration Summary</p>
-        <div className="flex items-center gap-6 text-sm">
-          <span className="text-zinc-400">Points collected:</span>
-          <span className={`font-medium ${calibrationPoints.length === 9 ? "text-emerald-400" : "text-amber-400"}`}>
-            {calibrationPoints.length} / 9
-          </span>
+      {isCloud ? (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-3">
+          <p className="text-xs text-zinc-500 uppercase tracking-wider">Input</p>
+          <p className="text-sm text-zinc-400">
+            Gaze samples from <span className="text-zinc-300">csv/gaze.csv</span>, shipped with the recording.
+          </p>
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={resample}
+              onChange={(e) => setResample(e.target.checked)}
+              className="mt-0.5 accent-indigo-500 cursor-pointer"
+            />
+            <span>
+              <span className="text-sm text-zinc-300">Resample to 30 fps</span>
+              <span className="block text-xs text-zinc-500 mt-0.5">
+                Puts Pupil Cloud's ~200 Hz gaze on the same timestamps our own pipeline predicts on.
+                Turn it off only to work at full rate — fixation counts then are not comparable
+                with the other sources.
+              </span>
+            </span>
+          </label>
         </div>
-        {calibrationPoints.length === 0 && (
-          <p className="text-xs text-amber-400">⚠ No calibration points — go back to Step 2</p>
-        )}
-      </div>
+      ) : (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-2">
+          <p className="text-xs text-zinc-500 uppercase tracking-wider">Calibration Summary</p>
+          <div className="flex items-center gap-6 text-sm">
+            <span className="text-zinc-400">Points collected:</span>
+            <span className={`font-medium ${calibrationPoints.length === 9 ? "text-emerald-400" : "text-amber-400"}`}>
+              {calibrationPoints.length} / 9
+            </span>
+          </div>
+          {calibrationPoints.length === 0 && (
+            <p className="text-xs text-amber-400">⚠ No calibration points — go back to Step 2</p>
+          )}
+        </div>
+      )}
 
       {/* Error */}
       {error && (
@@ -133,10 +174,22 @@ export function GazeMapStep({ recording, calibrationPoints, done: initialDone, o
           </div>
 
           <div className="grid grid-cols-3 gap-4">
-            <Stat label="Mean RMSE" value={`${result.mean_rmse.toFixed(1)} px`} />
+            {result.mean_rmse !== null ? (
+              <Stat label="Mean RMSE" value={`${result.mean_rmse.toFixed(1)} px`} />
+            ) : (
+              <Stat label="Gaze samples" value={String(result.total_frames)} />
+            )}
             <Stat label="Frames with gaze" value={pct(result.frames_with_gaze, result.total_frames)} />
             <Stat label="Frames on paper" value={pct(result.frames_on_paper, result.total_frames)} />
           </div>
+
+          {isCloud && result.n_cloud_samples !== undefined && (
+            <p className="text-xs text-zinc-500">
+              {result.resampled
+                ? `${result.n_cloud_samples} Pupil Cloud samples reduced to ${result.total_frames} at 30 fps.`
+                : `${result.total_frames} Pupil Cloud samples used at their full rate.`}
+            </p>
+          )}
 
           {result.residuals.length > 0 && (
             <div>
@@ -182,7 +235,7 @@ export function GazeMapStep({ recording, calibrationPoints, done: initialDone, o
       <div className="flex gap-3">
         <button
           onClick={handleRun}
-          disabled={running || calibrationPoints.length === 0}
+          disabled={running || (!isCloud && calibrationPoints.length === 0)}
           className="flex items-center gap-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500
                      disabled:opacity-40 disabled:cursor-not-allowed
                      text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"

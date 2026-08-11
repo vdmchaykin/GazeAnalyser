@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.database import get_db
+from app.api.routes.aoi import GAZE_SOURCES, _SOURCE_SUBDIR, read_source
 
 router = APIRouter(prefix="/api/export", tags=["export"])
 
@@ -27,6 +28,12 @@ class ExportSpec:
     subdir: str        # location inside the recording folder ("" = root)
     todo: str          # what the user must do when it is missing
     id_column: Optional[str]  # column identifying the recording, None if the file has none yet
+    # Gaze-derived files live in a per-source leaf of their subdir, so the export
+    # follows whichever source each recording is currently analysed from.
+    source_scoped: bool = False
+    # Sources that can produce the file at all — a file no selected recording can
+    # produce is left out of the manifest instead of listed as permanently missing.
+    sources: tuple = GAZE_SOURCES
 
 
 # surface_positions.csv has no "recording id" column, but its "section id" is
@@ -36,19 +43,25 @@ SPECS: tuple = (
     ExportSpec("events.csv", "Events", "",
                "Mark events in the Events section", "recording id"),
     ExportSpec("pupils.csv", "Gaze", "gaze_analysis",
-               "Run Step 1 — Pupil Detection in the Gaze section", "recording id"),
+               "Run Step 1 — Pupil Detection in the Gaze section", "recording id",
+               sources=("own",)),
     ExportSpec("gaze_predictions.csv", "Gaze", "gaze_analysis",
-               "Run Step 3 — Gaze Mapping in the Gaze section", "recording id"),
+               "Run Step 3 — Gaze Mapping in the Gaze section", "recording id",
+               source_scoped=True),
     ExportSpec("fixations.csv", "Gaze", "gaze_analysis",
-               "Run Step 4 — Fixations in the Gaze section", "recording id"),
+               "Run Step 4 — Fixations in the Gaze section", "recording id",
+               source_scoped=True),
     ExportSpec("fixations_on_surface.csv", "Gaze", "gaze_analysis",
-               "Run Step 4 — Fixations in the Gaze section", "recording id"),
+               "Run Step 4 — Fixations in the Gaze section", "recording id",
+               source_scoped=True),
     ExportSpec("surface_positions.csv", "Heatmap", "aoi",
                "Generate it in Heatmap → Surface positions", "section id"),
     ExportSpec("aoi_fixations.csv", "Heatmap", "aoi",
-               "Generate it in Heatmap → AoI Fixations", "recording id"),
+               "Generate it in Heatmap → AoI Fixations", "recording id",
+               source_scoped=True),
     ExportSpec("aoi_metrics.csv", "Heatmap", "aoi",
-               "Generate it in Heatmap → AoI Fixations", "recording id"),
+               "Generate it in Heatmap → AoI Fixations", "recording id",
+               source_scoped=True),
 )
 
 _BY_NAME = {s.name: s for s in SPECS}
@@ -69,7 +82,11 @@ def _spec(name: str) -> ExportSpec:
 
 def _path(rec: dict, spec: ExportSpec) -> Path:
     base = Path(rec["folder_path"])
-    return base / spec.subdir / spec.name if spec.subdir else base / spec.name
+    if spec.subdir:
+        base = base / spec.subdir
+    if spec.source_scoped:
+        base = base / _SOURCE_SUBDIR[read_source(rec["folder_path"])]
+    return base / spec.name
 
 
 def _has_rows(path: Path) -> bool:
@@ -188,9 +205,13 @@ def _availability(recs: List[dict], is_project: bool, spec: ExportSpec) -> dict:
 @router.get("/manifest")
 async def manifest(recording_id: Optional[str] = None, project_id: Optional[str] = None):
     recs, is_project, _ = await _resolve(recording_id, project_id)
+    # Each recording contributes the files of the source it is analysed from, so a
+    # project export mixes sources only if the user set them differently.
+    sources = sorted({read_source(r["folder_path"]) for r in recs})
     return {
         "is_project": is_project,
         "n_recordings": len(recs),
+        "sources": sources,
         "files": [
             {
                 "name": s.name,
@@ -199,6 +220,7 @@ async def manifest(recording_id: Optional[str] = None, project_id: Optional[str]
                 **_availability(recs, is_project, s),
             }
             for s in SPECS
+            if any(src in s.sources for src in sources)
         ],
     }
 

@@ -2,19 +2,20 @@ import { useEffect, useState } from "react";
 import { ScanEye, ChevronRight } from "lucide-react";
 import { api } from "@/lib/api";
 import { formatDuration, formatDate } from "@/lib/utils";
-import type { RecordingMeta, GazeStep, GazeAnalysisState } from "@/types";
+import { GAZE_SOURCE_STEPS, type RecordingMeta, type GazeStep, type GazeAnalysisState, type GazeSource } from "@/types";
 import { GazeDetectStep } from "@/components/gaze/GazeDetectStep";
 import { GazeCalibrateStep } from "@/components/gaze/GazeCalibrateStep";
 import { GazeMapStep } from "@/components/gaze/GazeMapStep";
 import { GazeFixationStep } from "@/components/gaze/GazeFixationStep";
+import { GazeSourceSelector } from "@/components/gaze/GazeSourceSelector";
 import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
 
-const STEPS: { id: GazeStep; label: string; short: string }[] = [
-  { id: "detect", label: "Detect Pupils", short: "Pupils" },
-  { id: "calibrate", label: "Calibrate", short: "Calibrate" },
-  { id: "map", label: "Map Gaze", short: "Map" },
-  { id: "fixations", label: "Fixations", short: "Fixations" },
-];
+const STEP_LABELS: Record<GazeStep, string> = {
+  detect: "Pupils",
+  calibrate: "Calibrate",
+  map: "Map",
+  fixations: "Fixations",
+};
 
 // Which analysis-state flag marks a step complete.
 const STEP_DONE_FLAG: Record<GazeStep, keyof GazeAnalysisState> = {
@@ -24,17 +25,37 @@ const STEP_DONE_FLAG: Record<GazeStep, keyof GazeAnalysisState> = {
   fixations: "fixations_done",
 };
 
+// Step numbers stay tied to the full pipeline, so "Step 3 — Gaze Mapping" means
+// the same thing whichever source is selected.
+const STEP_ORDER: GazeStep[] = ["detect", "calibrate", "map", "fixations"];
+const stepNumber = (id: GazeStep) => STEP_ORDER.indexOf(id) + 1;
+
+const EMPTY_STATE: GazeAnalysisState = {
+  source: "own",
+  available_sources: ["own"],
+  pupils_done: false,
+  calibration_done: false,
+  mapping_done: false,
+  fixations_done: false,
+  cloud_gaze_done: false,
+  cloud_fixations_done: false,
+  calibration_points: [],
+};
+
+/** Which step to open for a recording, based on how far this source has got. */
+function stepForState(state: GazeAnalysisState): GazeStep {
+  if (state.fixations_done) return "fixations";
+  if (state.mapping_done || state.calibration_done) return "map";
+  if (state.pupils_done) return "calibrate";
+  return GAZE_SOURCE_STEPS[state.source][0];
+}
+
 export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id: string) => void; initialRecording?: RecordingMeta }) {
   const [recordings, setRecordings] = useState<RecordingMeta[]>([]);
   const [selected, setSelected] = useState<RecordingMeta | null>(initialRecording ?? null);
   const [step, setStep] = useState<GazeStep>("detect");
-  const [analysisState, setAnalysisState] = useState<GazeAnalysisState>({
-    pupils_done: false,
-    calibration_done: false,
-    mapping_done: false,
-    fixations_done: false,
-    calibration_points: [],
-  });
+  const [analysisState, setAnalysisState] = useState<GazeAnalysisState>(EMPTY_STATE);
+  const [switchingSource, setSwitchingSource] = useState(false);
   const [loadingRecs, setLoadingRecs] = useState(true);
   // Gate the wizard until the recording's analysis state has loaded. Without
   // this, the "detect" step (the default) mounts before /gaze/state resolves and
@@ -58,16 +79,28 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
     try {
       const state = await api.get<GazeAnalysisState>(`/api/recordings/${id}/gaze/state`);
       setAnalysisState(state);
-      if (state.fixations_done) setStep("fixations");
-      else if (state.mapping_done) setStep("map");
-      else if (state.calibration_done) setStep("map");
-      else if (state.pupils_done) setStep("calibrate");
-      else setStep("detect");
+      setStep(stepForState(state));
     } catch {
-      setAnalysisState({ pupils_done: false, calibration_done: false, mapping_done: false, fixations_done: false, calibration_points: [] });
+      setAnalysisState(EMPTY_STATE);
       setStep("detect");
     } finally {
       setStateLoading(false);
+    }
+  };
+
+  // Switching source swaps the whole set of derived files, so the wizard reloads
+  // the new source's progress and lands on its first unfinished step.
+  const handleSourceChange = async (source: GazeSource) => {
+    if (!selected || source === analysisState.source) return;
+    setSwitchingSource(true);
+    try {
+      const state = await api.post<GazeAnalysisState>(
+        `/api/recordings/${selected.id}/gaze/source`, { source },
+      );
+      setAnalysisState(state);
+      setStep(stepForState(state));
+    } finally {
+      setSwitchingSource(false);
     }
   };
 
@@ -79,6 +112,8 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
   // Refresh analysis flags after a stage's data is deleted, without changing
   // which step the user is currently viewing.
   const applyState = (state: GazeAnalysisState) => setAnalysisState(state);
+
+  const steps = GAZE_SOURCE_STEPS[analysisState.source];
 
   if (!selected) {
     return (
@@ -133,20 +168,29 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
         </button>
         <span className="text-zinc-700">|</span>
         <span className="text-sm font-medium text-white">{selected.name}</span>
+
+        <GazeSourceSelector
+          value={analysisState.source}
+          available={analysisState.available_sources}
+          onChange={handleSourceChange}
+          disabled={stateLoading || switchingSource}
+        />
+
         <div className="flex-1" />
 
-        {/* Step indicator */}
+        {/* Step indicator — the cloud sources ship gaze instead of deriving it,
+            so their wizard starts at Map and steps keep their original numbers. */}
         <div className="flex items-center gap-0">
-          {STEPS.map((s, i) => {
+          {steps.map((id, i) => {
             // A stage is "done" purely from its completion flag, independent of
             // which step is currently open — so a finished stage stays green
             // even after navigating elsewhere.
-            const done = !!analysisState[STEP_DONE_FLAG[s.id]];
-            const current = s.id === step;
+            const done = !!analysisState[STEP_DONE_FLAG[id]];
+            const current = id === step;
             return (
-              <div key={s.id} className="flex items-center">
+              <div key={id} className="flex items-center">
                 <button
-                  onClick={() => setStep(s.id)}
+                  onClick={() => setStep(id)}
                   className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium
                               transition-colors cursor-pointer
                               ${current ? "bg-indigo-600 text-white" : done ? "text-emerald-400 hover:bg-zinc-800" : "text-zinc-500 hover:bg-zinc-800"}`}
@@ -159,11 +203,11 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
                     className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold
                     ${done ? "bg-emerald-500" : current ? "bg-indigo-400" : "bg-zinc-700"}`}
                   >
-                    {i + 1}
+                    {stepNumber(id)}
                   </span>
-                  {s.short}
+                  {STEP_LABELS[id]}
                 </button>
-                {i < STEPS.length - 1 && (
+                {i < steps.length - 1 && (
                   <div className={`w-8 h-px mx-1 ${done ? "bg-emerald-600" : "bg-zinc-700"}`} />
                 )}
               </div>
@@ -203,6 +247,7 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
         {!stateLoading && step === "map" && (
           <GazeMapStep
             recording={selected}
+            source={analysisState.source}
             calibrationPoints={analysisState.calibration_points}
             done={analysisState.mapping_done}
             onDone={() => setAnalysisState((s) => ({ ...s, mapping_done: true }))}
@@ -213,6 +258,7 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
         {!stateLoading && step === "fixations" && (
           <GazeFixationStep
             recording={selected}
+            source={analysisState.source}
             mappingDone={analysisState.mapping_done}
             done={analysisState.fixations_done}
             onDone={() => setAnalysisState((s) => ({ ...s, fixations_done: true }))}

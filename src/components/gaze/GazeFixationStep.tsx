@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { Play, RefreshCw, CheckCircle2, Trash2 } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
-import type { FixationResult, GazeAnalysisState, RecordingMeta } from "@/types";
+import type { FixationResult, GazeAnalysisState, GazeSource, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
 
 interface Props {
   recording: RecordingMeta;
+  source: GazeSource;
   mappingDone: boolean;
   done: boolean;
   onDone: () => void;
@@ -16,12 +17,16 @@ interface Props {
 // I-DT parameter defaults — must match the backend FixationRequest defaults.
 const DEFAULTS = { max_dispersion_deg: 1.5, min_duration_ms: 80, max_gap_ms: 100 };
 
-export function GazeFixationStep({ recording, mappingDone, done: initialDone, onDone, onDeleted }: Props) {
+export function GazeFixationStep({ recording, source, mappingDone, done: initialDone, onDone, onDeleted }: Props) {
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState(initialDone);
   const [result, setResult] = useState<FixationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [params, setParams] = useState(DEFAULTS);
+
+  // The cloud_native source takes Pupil Cloud's own fixations instead of running
+  // I-DT, so it has no parameters to tune — only a surface projection to add.
+  const imports = source === "cloud_native";
 
   // Load the last run's stats (and the params it used) when arriving on an
   // already-computed recording.
@@ -35,11 +40,14 @@ export function GazeFixationStep({ recording, mappingDone, done: initialDone, on
         const data: FixationResult | null = await res.json();
         if (!cancelled && data) {
           setResult(data);
-          setParams({
-            max_dispersion_deg: data.max_dispersion_deg,
-            min_duration_ms: data.min_duration_ms,
-            max_gap_ms: data.max_gap_ms,
-          });
+          // Imported fixations carry no I-DT parameters — keep the defaults then.
+          if (data.max_dispersion_deg !== undefined) {
+            setParams({
+              max_dispersion_deg: data.max_dispersion_deg,
+              min_duration_ms: data.min_duration_ms ?? DEFAULTS.min_duration_ms,
+              max_gap_ms: data.max_gap_ms ?? DEFAULTS.max_gap_ms,
+            });
+          }
         }
       } catch {
         /* leave result null — falls back to the "already done" notice */
@@ -90,11 +98,17 @@ export function GazeFixationStep({ recording, mappingDone, done: initialDone, on
   return (
     <div className="p-8 max-w-3xl mx-auto space-y-8">
       <div>
-        <h2 className="text-lg font-semibold text-white">Step 4 — Fixations</h2>
+        <h2 className="text-lg font-semibold text-white">
+          {imports ? "Step 4 — Import Pupil Fixations" : "Step 4 — Fixations"}
+        </h2>
         <p className="text-sm text-zinc-400 mt-1">
-          Detect fixations from the mapped gaze with a dispersion algorithm (I-DT). Fixations are
-          found in scene-camera pixels and annotated with surface coordinates when the gaze falls
-          on the paper.
+          {imports
+            ? "Take Pupil Cloud's own fixations as they are and add the one thing their export "
+              + "lacks: surface coordinates, projected with the same AoI marker homography our "
+              + "own fixations use."
+            : "Detect fixations from the mapped gaze with a dispersion algorithm (I-DT). Fixations are "
+              + "found in scene-camera pixels and annotated with surface coordinates when the gaze falls "
+              + "on the paper."}
         </p>
       </div>
 
@@ -104,7 +118,18 @@ export function GazeFixationStep({ recording, mappingDone, done: initialDone, on
         </div>
       )}
 
+      {imports && (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-2">
+          <p className="text-xs text-zinc-500 uppercase tracking-wider">Input</p>
+          <p className="text-sm text-zinc-400">
+            Fixation rows from <span className="text-zinc-300">csv/fixations.csv</span>, shipped with
+            the recording. No I-DT parameters apply — the detection was done on device.
+          </p>
+        </div>
+      )}
+
       {/* Parameters */}
+      {!imports && (
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-5">
         <p className="text-xs text-zinc-500 uppercase tracking-wider">Parameters</p>
         <ParamSlider
@@ -132,6 +157,7 @@ export function GazeFixationStep({ recording, mappingDone, done: initialDone, on
           hint="A longer gap (blink / tracking loss) ends the current fixation."
         />
       </div>
+      )}
 
       {/* Error */}
       {error && (
@@ -145,7 +171,9 @@ export function GazeFixationStep({ recording, mappingDone, done: initialDone, on
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
           <div className="flex items-center gap-2 text-emerald-400">
             <CheckCircle2 className="w-5 h-5" />
-            <span className="text-sm font-medium">Fixation detection complete</span>
+            <span className="text-sm font-medium">
+              {imports ? "Pupil fixations imported" : "Fixation detection complete"}
+            </span>
           </div>
 
           <div className="grid grid-cols-3 gap-4">
@@ -157,10 +185,12 @@ export function GazeFixationStep({ recording, mappingDone, done: initialDone, on
             <Stat label="On surface" value={`${result.pct_on_surface.toFixed(0)}%`} />
           </div>
 
-          <p className="text-xs text-zinc-500">
-            Scene-space detection has no head-motion compensation, so long fixations may fragment
-            while the head turns — expect more, shorter fixations than Pupil Cloud.
-          </p>
+          {!imports && (
+            <p className="text-xs text-zinc-500">
+              Scene-space detection has no head-motion compensation, so long fixations may fragment
+              while the head turns — expect more, shorter fixations than Pupil Cloud.
+            </p>
+          )}
         </div>
       )}
 
@@ -183,9 +213,14 @@ export function GazeFixationStep({ recording, mappingDone, done: initialDone, on
                      text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"
         >
           {running ? (
-            <><RefreshCw className="w-4 h-4 animate-spin" /> Computing…</>
+            <><RefreshCw className="w-4 h-4 animate-spin" /> {imports ? "Importing…" : "Computing…"}</>
           ) : (
-            <><Play className="w-4 h-4" />{done ? "Re-run Detection" : "Compute Fixations"}</>
+            <>
+              <Play className="w-4 h-4" />
+              {imports
+                ? (done ? "Re-import Fixations" : "Import Fixations")
+                : (done ? "Re-run Detection" : "Compute Fixations")}
+            </>
           )}
         </button>
         {done && !running && (

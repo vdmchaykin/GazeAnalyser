@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
-  Play, Pause, Eye, EyeOff, Volume2, VolumeX, Maximize2, ScanEye, CircleDot, Route,
+  Play, Pause, Eye, EyeOff, Volume2, VolumeX, Maximize2, ScanEye, CircleDot, Route, Cloud,
 } from "lucide-react";
-import type { Fixation, GazePrediction, PupilData } from "@/types";
+import type {
+  CloudGaze, Fixation, GazePrediction, PupilData, SceneMotionData, SurfacePositionsData,
+} from "@/types";
+import {
+  applyMat, chainTo, matFrom8, nearestIndex, unitSquareToQuad, type Mat3,
+} from "@/lib/sceneAnchor";
+import { ScanpathPanel, type AnchorStats } from "./ScanpathPanel";
 
 // Trailing time window (seconds) of fixations drawn in the scanpath overlay.
 const SCANPATH_WINDOW_S = 3;
@@ -46,10 +52,27 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
   const predsRef = useRef<GazePrediction[]>([]);
   const naturalSizeRef = useRef({ w: 1920, h: 1080 });
 
+  // Pupil Cloud gaze overlay refs (csv/gaze.csv) + the canvas that links the two
+  // gaze dots when both overlays are on.
+  const cloudDotRef = useRef<HTMLDivElement>(null);
+  const cloudRef = useRef<CloudGaze[]>([]);
+  const linkCanvasRef = useRef<HTMLCanvasElement>(null);
+
   // Scanpath overlay refs
   const scanCanvasRef = useRef<HTMLCanvasElement>(null);
   const scanRafRef = useRef<number>(0);
   const fixationsRef = useRef<Fixation[]>([]);
+
+  // Scene-frame index. Every per-frame product (surface corners, egomotion) is
+  // keyed by scene frame, so playback position has to resolve to a real frame.
+  const sceneTsRef = useRef<Float64Array>(new Float64Array(0));   // device ts (ns) per frame
+  const sceneRelRef = useRef<Float64Array>(new Float64Array(0));  // seconds since frame 0
+
+  // Scanpath anchoring inputs — surface corners per frame and per-frame-pair
+  // egomotion. Both optional; without them fixations are drawn where measured.
+  const surfaceRef = useRef<(number[] | null)[]>([]);
+  const motionRef = useRef<(Mat3 | null)[]>([]);
+  const anchorStatsRef = useRef<AnchorStats>({ surface: 0, flow: 0, fixed: 0 });
 
   // Pupil overlay refs
   const eyePipRef = useRef<HTMLDivElement>(null);
@@ -76,16 +99,28 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
   const [showGaze, setShowGaze] = useState(false);
   const [gazeLoaded, setGazeLoaded] = useState(false);
 
+  const [showCloudGaze, setShowCloudGaze] = useState(false);
+  const [cloudLoaded, setCloudLoaded] = useState(false);
+
+  // Options for the compare panel that appears once both gaze overlays are on.
+  const [linkGaze, setLinkGaze] = useState(true);
+
   const [showPupils, setShowPupils] = useState(false);
   const [pupilsLoaded, setPupilsLoaded] = useState(false);
 
   const [showScanpath, setShowScanpath] = useState(false);
   const [scanpathLoaded, setScanpathLoaded] = useState(false);
 
+  // Scene anchoring for the scanpath: transport past fixations into the current
+  // frame so they stay on their target instead of on a screen position.
+  const [anchorScene, setAnchorScene] = useState(true);
+  const [surfaceLocalized, setSurfaceLocalized] = useState<number | null>(null);
+  const [motionSolved, setMotionSolved] = useState<number | null>(null);
+
   // Which overlays actually have generated data — drives whether each toggle
   // button is enabled. Fetched up front so a user can't turn on an overlay that
   // would render nothing.
-  const [avail, setAvail] = useState({ gaze: false, pupils: false, fixations: false });
+  const [avail, setAvail] = useState({ gaze: false, pupils: false, fixations: false, cloud: false });
 
   // Fetch analysis state up front so overlay buttons can be disabled when their
   // data hasn't been generated yet (gaze mapping / pupils / fixations).
@@ -93,9 +128,14 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
     let cancelled = false;
     fetch(`${API}/api/recordings/${recordingId}/gaze/state`)
       .then((r) => r.json())
-      .then((s: { pupils_done?: boolean; mapping_done?: boolean; fixations_done?: boolean }) => {
+      .then((s: { pupils_done?: boolean; mapping_done?: boolean; fixations_done?: boolean; cloud_gaze_done?: boolean }) => {
         if (!cancelled) {
-          setAvail({ gaze: !!s.mapping_done, pupils: !!s.pupils_done, fixations: !!s.fixations_done });
+          setAvail({
+            gaze: !!s.mapping_done,
+            pupils: !!s.pupils_done,
+            fixations: !!s.fixations_done,
+            cloud: !!s.cloud_gaze_done,
+          });
         }
       })
       .catch(() => {});
@@ -208,6 +248,18 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       .catch(() => {});
   }, [showGaze, gazeLoaded, recordingId]);
 
+  // Load Pupil Cloud gaze when its overlay is first enabled
+  useEffect(() => {
+    if (!showCloudGaze || cloudLoaded) return;
+    fetch(`${API}/api/recordings/${recordingId}/gaze/cloud`)
+      .then((r) => r.json())
+      .then((data: CloudGaze[]) => {
+        cloudRef.current = data;
+        setCloudLoaded(true);
+      })
+      .catch(() => {});
+  }, [showCloudGaze, cloudLoaded, recordingId]);
+
   // Load fixations when the scanpath overlay is first enabled
   useEffect(() => {
     if (!showScanpath || scanpathLoaded) return;
@@ -219,6 +271,70 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       })
       .catch(() => {});
   }, [showScanpath, scanpathLoaded, recordingId]);
+
+  // Drop the per-recording caches when the player switches recording, so a stale
+  // frame index can never be applied to another recording's video.
+  useEffect(() => {
+    sceneTsRef.current = new Float64Array(0);
+    sceneRelRef.current = new Float64Array(0);
+    surfaceRef.current = [];
+    motionRef.current = [];
+    setSurfaceLocalized(null);
+    setMotionSolved(null);
+  }, [recordingId]);
+
+  // Scene-frame timestamps — the bridge between playback position and the gaze
+  // clock. The scene video and the gaze stream start a few frames apart, which a
+  // fraction-of-the-clip mapping cannot express, and every per-frame product is
+  // addressed by frame index anyway.
+  useEffect(() => {
+    if (!(showGaze || showCloudGaze || showScanpath) || sceneTsRef.current.length) return;
+    fetch(`${API}/api/recordings/${recordingId}/gaze/scene-timestamps`)
+      .then((r) => r.json())
+      .then(({ ts_ns }: { ts_ns: number[] }) => {
+        if (!ts_ns?.length) return;
+        const ts = Float64Array.from(ts_ns);
+        const rel = new Float64Array(ts.length);
+        for (let i = 0; i < ts.length; i++) rel[i] = (ts[i] - ts[0]) / 1e9;
+        sceneTsRef.current = ts;
+        sceneRelRef.current = rel;
+      })
+      .catch(() => {});
+  }, [showGaze, showCloudGaze, showScanpath, recordingId]);
+
+  // Anchoring inputs. Refetched whenever the overlay is turned on, so regenerating
+  // either file and reopening the overlay is enough to pick it up.
+  const loadSurface = useCallback(() => {
+    fetch(`${API}/api/recordings/${recordingId}/aoi/surface-positions/data`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: SurfacePositionsData | null) => {
+        surfaceRef.current = d?.corners ?? [];
+        setSurfaceLocalized(d ? d.localized : null);
+      })
+      .catch(() => {});
+  }, [recordingId]);
+
+  const loadMotion = useCallback(() => {
+    fetch(`${API}/api/recordings/${recordingId}/motion/data`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: SceneMotionData | null) => {
+        motionRef.current = (d?.h ?? []).map((h) => (h ? matFrom8(h) : null));
+        setMotionSolved(d ? d.solved : null);
+      })
+      .catch(() => {});
+  }, [recordingId]);
+
+  useEffect(() => {
+    if (!showScanpath) return;
+    loadSurface();
+    loadMotion();
+  }, [showScanpath, loadSurface, loadMotion]);
+
+  /** Playback position → scene frame index, or -1 when there is no .time file. */
+  const frameAt = useCallback((t: number): number => {
+    const rel = sceneRelRef.current;
+    return rel.length ? nearestIndex(rel, t) : -1;
+  }, []);
 
   // Load pupils data when overlay is first enabled
   useEffect(() => {
@@ -334,34 +450,38 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
     return () => cancelAnimationFrame(pupilRafRef.current);
   }, [showPupils, showEye]);
 
-  // rAF loop — updates gaze dot directly in DOM, bypasses React state
+  // rAF loop — updates both gaze dots (mapped + Pupil Cloud) directly in DOM and
+  // draws the link between them, bypassing React state. Both sources are sampled
+  // at the same playback fraction so the distance readout compares like with like.
   useEffect(() => {
-    if (!showGaze) {
-      const dot = gazeDotRef.current;
-      if (dot) dot.style.display = "none";
+    const clear = () => {
+      if (gazeDotRef.current) gazeDotRef.current.style.display = "none";
+      if (cloudDotRef.current) cloudDotRef.current.style.display = "none";
+      const c = linkCanvasRef.current;
+      const cx = c?.getContext("2d");
+      if (c && cx) cx.clearRect(0, 0, c.width, c.height);
+    };
+
+    if (!showGaze && !showCloudGaze) {
+      clear();
       cancelAnimationFrame(rafRef.current);
       return;
     }
 
+    // Match a source to the current playback position by fraction of its own
+    // timespan — each CSV has its own sampling rate and clock offset.
+    const sampleAt = <T extends { timestamp_ns: number }>(arr: T[], frac: number): T | null => {
+      if (arr.length === 0) return null;
+      const t0 = arr[0].timestamp_ns;
+      const t1 = arr[arr.length - 1].timestamp_ns;
+      return findNearest(arr, t0 + frac * (t1 - t0));
+    };
+
     const tick = () => {
       const v = sceneRef.current;
-      const dot = gazeDotRef.current;
       const container = containerRef.current;
-      const preds = predsRef.current;
 
-      if (!v || !dot || !container || preds.length === 0) {
-        rafRef.current = requestAnimationFrame(tick);
-        return;
-      }
-
-      const t0 = preds[0].timestamp_ns;
-      const t1 = preds[preds.length - 1].timestamp_ns;
-      const dur = v.duration || 1;
-      const targetNs = t0 + (v.currentTime / dur) * (t1 - t0);
-      const pred = findNearest(preds, targetNs);
-
-      if (!pred) {
-        dot.style.display = "none";
+      if (!v || !container) {
         rafRef.current = requestAnimationFrame(tick);
         return;
       }
@@ -373,19 +493,82 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       const ox = (cw - w * scale) / 2;
       const oy = (ch - h * scale) / 2;
 
-      const x = ox + pred.pred_gaze_x * scale;
-      const y = oy + pred.pred_gaze_y * scale;
+      // Prefer the real scene frame's device timestamp; the fraction mapping is
+      // only a fallback for recordings without a scene .time file.
+      const frac = Math.min(1, Math.max(0, v.currentTime / (v.duration || 1)));
+      const idx = frameAt(v.currentTime);
+      const tsNs = idx >= 0 ? sceneTsRef.current[idx] : null;
+      const sample = <T extends { timestamp_ns: number }>(arr: T[]): T | null =>
+        tsNs !== null ? findNearest(arr, tsNs) : sampleAt(arr, frac);
 
-      dot.style.display = "block";
-      dot.style.left = `${x - 12}px`;
-      dot.style.top = `${y - 12}px`;
+      const pred = showGaze ? sample(predsRef.current) : null;
+      const cloud = showCloudGaze ? sample(cloudRef.current) : null;
+
+      // Scene-pixel coordinates of each dot (null when its source has no sample).
+      const pPt = pred ? { x: pred.pred_gaze_x, y: pred.pred_gaze_y } : null;
+      const cPt = cloud ? { x: cloud.x, y: cloud.y } : null;
+
+      const place = (dot: HTMLDivElement | null, pt: { x: number; y: number } | null) => {
+        if (!dot) return;
+        if (!pt) { dot.style.display = "none"; return; }
+        dot.style.display = "block";
+        dot.style.left = `${ox + pt.x * scale - 12}px`;
+        dot.style.top = `${oy + pt.y * scale - 12}px`;
+      };
+      place(gazeDotRef.current, pPt);
+      place(cloudDotRef.current, cPt);
+
+      // Link line + distance label between the two gaze estimates.
+      const canvas = linkCanvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (canvas && ctx) {
+        const dpr = window.devicePixelRatio || 1;
+        if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
+          canvas.width = Math.round(cw * dpr);
+          canvas.height = Math.round(ch * dpr);
+          canvas.style.width = `${cw}px`;
+          canvas.style.height = `${ch}px`;
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cw, ch);
+
+        if (linkGaze && pPt && cPt) {
+          const x1 = ox + pPt.x * scale, y1 = oy + pPt.y * scale;
+          const x2 = ox + cPt.x * scale, y2 = oy + cPt.y * scale;
+          // Distance is reported in scene-camera pixels, not screen pixels, so it
+          // stays comparable regardless of window size.
+          const distPx = Math.hypot(pPt.x - cPt.x, pPt.y - cPt.y);
+
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.75)";
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+          ctx.restore();
+
+          const label = `${Math.round(distPx)} px`;
+          const mx = (x1 + x2) / 2;
+          const my = (y1 + y2) / 2;
+          ctx.font = "600 12px system-ui, sans-serif";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          const tw = ctx.measureText(label).width;
+          ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+          ctx.fillRect(mx - tw / 2 - 5, my - 9, tw + 10, 18);
+          ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+          ctx.fillText(label, mx, my);
+        }
+      }
 
       rafRef.current = requestAnimationFrame(tick);
     };
 
     rafRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [showGaze]);
+    return () => { cancelAnimationFrame(rafRef.current); clear(); };
+  }, [showGaze, showCloudGaze, linkGaze, frameAt]);
 
   // rAF loop — draws the scanpath (fixations + saccades) on a canvas overlay
   useEffect(() => {
@@ -429,10 +612,16 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       const ox = (cw - w * scale) / 2;
       const oy = (ch - h * scale) / 2;
 
-      const t0 = fixations[0].start_ts_ns;
-      const t1 = fixations[fixations.length - 1].end_ts_ns;
-      const dur = v.duration || 1;
-      const targetNs = t0 + (v.currentTime / dur) * (t1 - t0);
+      // Current scene frame and the gaze-clock time it stands for.
+      const curIdx = frameAt(v.currentTime);
+      let targetNs: number;
+      if (curIdx >= 0) {
+        targetNs = sceneTsRef.current[curIdx];
+      } else {
+        const t0 = fixations[0].start_ts_ns;
+        const t1 = fixations[fixations.length - 1].end_ts_ns;
+        targetNs = t0 + (v.currentTime / (v.duration || 1)) * (t1 - t0);
+      }
       const windowNs = SCANPATH_WINDOW_S * 1e9;
 
       // Visible = active or ended within the trailing window; never future ones.
@@ -440,12 +629,61 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
         (f) => f.start_ts_ns <= targetNs && f.end_ts_ns >= targetNs - windowNs,
       );
       if (vis.length === 0) {
+        anchorStatsRef.current = { surface: 0, flow: 0, fixed: 0 };
         scanRafRef.current = requestAnimationFrame(tick);
         return;
       }
 
-      const sx = (f: Fixation) => ox + f.x_px * scale;
-      const sy = (f: Fixation) => oy + f.y_px * scale;
+      // ── Anchoring ───────────────────────────────────────────────────────────
+      // Every fixation older than the current frame was measured in a frame the
+      // camera has since moved away from. Two transports bring it back onto its
+      // target, tried in this order:
+      //
+      //  1. the AoI surface as seen in THIS frame — a fixation on the paper keeps
+      //     normalized surface coordinates, which are valid in every frame where
+      //     the surface is localized. Exact, and it never accumulates error.
+      //  2. scene egomotion — chain the frame-to-frame homographies from the
+      //     fixation's own frame up to this one. Works anywhere, but assumes a
+      //     rotation-dominated camera and drifts as the chain grows, which is why
+      //     it is only the fallback.
+      const corners = anchorScene && curIdx >= 0 ? surfaceRef.current[curIdx] ?? null : null;
+      const surfH = corners ? unitSquareToQuad(corners) : null;
+
+      const motion = motionRef.current;
+      // The chain never has to reach further back than the trailing window (plus
+      // one fixation's worth of slack), which bounds both cost and drift.
+      const chainFrom = Math.max(0, frameAt(Math.max(0, v.currentTime - SCANPATH_WINDOW_S - 1)));
+      let chain: Mat3[] | null = null;
+      const chainAt = (idx: number): Mat3 | null => {
+        if (!anchorScene || curIdx < 0 || motion.length === 0) return null;
+        if (!chain) chain = chainTo(motion, chainFrom, curIdx);
+        return chain[Math.min(curIdx, Math.max(chainFrom, idx)) - chainFrom] ?? null;
+      };
+
+      const stats: AnchorStats = { surface: 0, flow: 0, fixed: 0 };
+      const anchor = (f: Fixation): [number, number] => {
+        if (surfH && f.on_surface && f.norm_x !== null && f.norm_y !== null) {
+          stats.surface++;
+          return applyMat(surfH, f.norm_x, f.norm_y);
+        }
+        // The stored coordinate is the median over the fixation, so its middle
+        // frame is where that coordinate is most nearly true.
+        const midNs = (f.start_ts_ns + f.end_ts_ns) / 2;
+        const m = chainAt(nearestIndex(sceneTsRef.current, midNs));
+        if (m) {
+          stats.flow++;
+          return applyMat(m, f.x_px, f.y_px);
+        }
+        stats.fixed++;
+        return [f.x_px, f.y_px];
+      };
+
+      // Resolved once per rendered frame; the saccade and circle passes reuse it.
+      const pts = vis.map(anchor);
+      anchorStatsRef.current = stats;
+
+      const sx = (i: number) => ox + pts[i][0] * scale;
+      const sy = (i: number) => oy + pts[i][1] * scale;
       // Fade older fixations by how long ago they ended.
       const alphaOf = (f: Fixation) => {
         const age = Math.max(0, targetNs - f.end_ts_ns);
@@ -458,8 +696,8 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       for (let i = 1; i < vis.length; i++) {
         ctx.strokeStyle = `rgba(251, 191, 36, ${alphaOf(vis[i]) * 0.6})`;
         ctx.beginPath();
-        ctx.moveTo(sx(vis[i - 1]), sy(vis[i - 1]));
-        ctx.lineTo(sx(vis[i]), sy(vis[i]));
+        ctx.moveTo(sx(i - 1), sy(i - 1));
+        ctx.lineTo(sx(i), sy(i));
         ctx.stroke();
       }
 
@@ -467,11 +705,12 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       ctx.font = "600 12px system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      for (const f of vis) {
+      for (let i = 0; i < vis.length; i++) {
+        const f = vis[i];
         const a = alphaOf(f);
         const r = radiusOf(f);
-        const x = sx(f);
-        const y = sy(f);
+        const x = sx(i);
+        const y = sy(i);
         const current = f.start_ts_ns <= targetNs && f.end_ts_ns >= targetNs;
 
         ctx.beginPath();
@@ -493,7 +732,7 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
 
     scanRafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(scanRafRef.current);
-  }, [showScanpath]);
+  }, [showScanpath, anchorScene, frameAt]);
 
   // Space bar toggle
   useEffect(() => {
@@ -575,6 +814,13 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
           style={{ display: showScanpath ? "block" : "none", zIndex: 7 }}
         />
 
+        {/* Link between the two gaze dots — drawn by the same rAF loop */}
+        <canvas
+          ref={linkCanvasRef}
+          className="absolute inset-0 pointer-events-none"
+          style={{ display: showGaze && showCloudGaze && linkGaze ? "block" : "none", zIndex: 7 }}
+        />
+
         {/* Gaze dot — always in DOM when showGaze, position updated by rAF */}
         <div
           ref={gazeDotRef}
@@ -584,6 +830,57 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
           <div className="w-full h-full rounded-full bg-red-500/30 border-2 border-red-500 shadow-lg shadow-red-500/50" />
           <div className="absolute rounded-full bg-red-400" style={{ width: 6, height: 6, left: 9, top: 9 }} />
         </div>
+
+        {/* Pupil Cloud gaze dot (csv/gaze.csv) */}
+        <div
+          ref={cloudDotRef}
+          className="absolute pointer-events-none"
+          style={{ display: "none", width: 24, height: 24, zIndex: 8 }}
+        >
+          <div className="w-full h-full rounded-full bg-sky-500/30 border-2 border-sky-400 shadow-lg shadow-sky-500/50" />
+          <div className="absolute rounded-full bg-sky-300" style={{ width: 6, height: 6, left: 9, top: 9 }} />
+        </div>
+
+        {/* Compare panel — only meaningful while both gaze overlays are visible */}
+        {showGaze && showCloudGaze && (
+          <div
+            className="absolute top-4 right-4 w-56 rounded-lg border border-zinc-700
+                       bg-zinc-900/90 backdrop-blur px-3 py-2.5 shadow-xl shadow-black/50"
+            style={{ zIndex: 20 }}
+          >
+            <p className="text-[11px] font-medium text-zinc-300 mb-2">Gaze comparison</p>
+            <div className="flex flex-col gap-1 mb-2 text-[11px] text-zinc-400">
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-red-500 shrink-0" /> Mapped (this app)
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-sky-400 shrink-0" /> Pupil Cloud
+              </span>
+            </div>
+            <label className="flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={linkGaze}
+                onChange={(e) => setLinkGaze(e.target.checked)}
+                className="accent-indigo-500 cursor-pointer"
+              />
+              Connecting line + distance
+            </label>
+          </div>
+        )}
+
+        {/* Scanpath anchoring controls + the scene-motion job they depend on */}
+        {showScanpath && (
+          <ScanpathPanel
+            recordingId={recordingId}
+            anchor={anchorScene}
+            onAnchorChange={setAnchorScene}
+            surfaceLocalized={surfaceLocalized}
+            motionSolved={motionSolved}
+            statsRef={anchorStatsRef}
+            onMotionReady={loadMotion}
+          />
+        )}
 
         {/* Center play/pause click area */}
         <div
@@ -663,6 +960,23 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
               ${showGaze ? "text-red-400 hover:text-red-300" : "text-zinc-600 hover:text-zinc-400"}`}
           >
             <ScanEye className="w-4 h-4" />
+          </button>
+
+          {/* Reference-gaze overlay toggle — draws Pupil Cloud's raw gaze ALONGSIDE
+              the mapped one for comparison. Unrelated to the Gaze section's source
+              selector, which picks what the whole pipeline runs on. */}
+          <button
+            onClick={() => setShowCloudGaze((v) => !v)}
+            disabled={!avail.cloud}
+            title={!avail.cloud
+              ? "No reference gaze — csv/gaze.csv not found"
+              : showCloudGaze ? "Hide reference gaze (Pupil Cloud)" : "Show reference gaze (Pupil Cloud)"}
+            className={`p-1.5 rounded transition-colors
+              disabled:opacity-30 disabled:cursor-not-allowed
+              ${avail.cloud ? "cursor-pointer" : ""}
+              ${showCloudGaze ? "text-sky-400 hover:text-sky-300" : "text-zinc-600 hover:text-zinc-400"}`}
+          >
+            <Cloud className="w-4 h-4" />
           </button>
 
           {/* Scanpath overlay toggle */}

@@ -19,6 +19,12 @@ from app.api.routes.aoi import (
     _APRILTAG_AVAILABLE,
     _BULK_QUAD_DECIMATE,
     _BULK_NTHREADS,
+    GAZE_SOURCES,
+    CLOUD_SOURCES,
+    active_source,
+    check_source,
+    read_source,
+    write_source,
 )
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent.parent / "Gaze_estimation"))
@@ -45,15 +51,47 @@ async def _get_recording(recording_id: str) -> dict:
 
 # ── state ──────────────────────────────────────────────────────────────────
 
-def _gaze_state_dict(gdir: Path) -> dict:
+def _cloud_gaze_path(folder_path: str) -> Path:
+    """Pupil Cloud's gaze export, shipped with the recording."""
+    return Path(folder_path) / "csv" / "gaze.csv"
+
+
+def _cloud_fixations_path(folder_path: str) -> Path:
+    """Pupil Cloud's own fixation export (event_type 1 = fixation)."""
+    return Path(folder_path) / "csv" / "fixations.csv"
+
+
+def _available_sources(folder_path: str) -> list:
+    """Which gaze sources this recording actually has the input data for."""
+    has_gaze = _cloud_gaze_path(folder_path).exists()
+    return [
+        s for s in GAZE_SOURCES
+        if s == "own"
+        or (s == "cloud" and has_gaze)
+        or (s == "cloud_native" and has_gaze and _cloud_fixations_path(folder_path).exists())
+    ]
+
+
+def _gaze_state_dict(folder_path: str, source: str) -> dict:
+    """Stage-completion flags for one source's leaf directory.
+
+    Pupil detection and calibration only exist in the "own" pipeline; for the
+    cloud sources their flags stay false and the wizard hides those steps."""
+    gdir = _gaze_dir(folder_path, source)
     calib_file = gdir / "calibration_points.json"
     calibration_done = calib_file.exists()
     calibration_points = json.loads(calib_file.read_text()) if calibration_done else []
     return {
+        "source": source,
+        "available_sources": _available_sources(folder_path),
         "pupils_done": (gdir / "pupils.csv").exists(),
         "calibration_done": calibration_done,
         "mapping_done": (gdir / "gaze_predictions.csv").exists(),
         "fixations_done": (gdir / "fixations.csv").exists(),
+        # Pupil Cloud's own exports — shipped with the recording, not produced by
+        # any of our stages, so they are available independently of them.
+        "cloud_gaze_done": _cloud_gaze_path(folder_path).exists(),
+        "cloud_fixations_done": _cloud_fixations_path(folder_path).exists(),
         "calibration_points": calibration_points,
     }
 
@@ -71,27 +109,55 @@ _STAGE_FILES: dict[str, list[str]] = {
 
 
 @router.get("/state")
-async def get_gaze_state(recording_id: str):
+async def get_gaze_state(recording_id: str, source: Optional[str] = None):
     rec = await _get_recording(recording_id)
-    return _gaze_state_dict(_gaze_dir(rec["folder_path"]))
+    src = active_source(rec["folder_path"], source)
+    return _gaze_state_dict(rec["folder_path"], src)
+
+
+class SourceBody(BaseModel):
+    source: str
+
+
+@router.post("/source")
+async def set_gaze_source(recording_id: str, body: SourceBody):
+    """Switch which gaze source this recording is analysed from, and persist it.
+
+    Persisted rather than kept in the UI because every later section (AoI metrics,
+    export, player) resolves the recording's source on its own."""
+    rec = await _get_recording(recording_id)
+    check_source(body.source)
+    if body.source not in _available_sources(rec["folder_path"]):
+        raise HTTPException(
+            status_code=400,
+            detail=f"This recording has no input data for the '{body.source}' source",
+        )
+    write_source(rec["folder_path"], body.source)
+    return _gaze_state_dict(rec["folder_path"], body.source)
 
 
 @router.delete("/data/{stage}")
-async def delete_gaze_data(recording_id: str, stage: str):
+async def delete_gaze_data(recording_id: str, stage: str, source: Optional[str] = None):
     """Delete a stage's output and everything downstream that depends on it."""
     if stage not in _STAGE_FILES:
         raise HTTPException(status_code=400, detail=f"Unknown stage '{stage}'")
     rec = await _get_recording(recording_id)
-    gdir = _gaze_dir(rec["folder_path"])
+    src = active_source(rec["folder_path"], source)
+    # The cloud sources share one gaze projection (see map_gaze), so dropping it
+    # for one of them has to drop the copy the other holds too.
+    targets = CLOUD_SOURCES if (src in CLOUD_SOURCES and stage == "mapping") else (src,)
     removed = []
-    for name in _STAGE_FILES[stage]:
-        f = gdir / name
-        if f.exists():
-            f.unlink()
-            removed.append(name)
+    for target in targets:
+        gdir = _gaze_dir(rec["folder_path"], target)
+        for name in _STAGE_FILES[stage]:
+            f = gdir / name
+            if f.exists():
+                f.unlink()
+                if name not in removed:
+                    removed.append(name)
     if stage == "pupils":
         _detect_jobs.pop(recording_id, None)
-    return {"removed": removed, **_gaze_state_dict(gdir)}
+    return {"removed": removed, **_gaze_state_dict(rec["folder_path"], src)}
 
 
 # ── video info + frame extraction ──────────────────────────────────────────
@@ -1011,10 +1077,171 @@ async def get_calibration(recording_id: str):
 
 # ── gaze mapping ───────────────────────────────────────────────────────────
 
+_PREDICTION_COLS = ["recording id", "timestamp_ns", "pred_gaze_x", "pred_gaze_y", "paper_x", "paper_y"]
+
+
+def _make_paper_projector(rec: dict):
+    """Build a scene-px → normalized-paper projector from the AoI surface registry.
+
+    Uses the AoI editor's registry so paper gaze shares its coordinate system (same
+    tag OUTER-corner homography, any tag IDs, 3+ tags). Returns
+    ``project(ts_ns, x, y, frame_i)`` → ``(paper_x, paper_y)``, or ``(None, None)``
+    when the surface is not localizable in that frame or the point misses it.
+    Building this scans the whole scene video once, so make one and reuse it."""
+    folder_path = rec["folder_path"]
+    scene_path = rec.get("scene_video")
+    if scene_path:
+        registry = _build_recording_registry(_aoi_dir(folder_path), scene_path)
+        scene_ts, homographies = _build_homographies(scene_path, registry)
+    else:
+        scene_ts, homographies = np.array([], dtype=np.int64), {}
+    have_scene_ts = scene_ts.size > 0
+
+    def project(ts_ns: int, x: float, y: float, frame_i: Optional[int] = None):
+        # Match the scene frame by NEAREST TIMESTAMP (not positional index): the
+        # gaze grid and the scene video are separate streams with a ~4-frame start
+        # offset. Fall back to index only if the scene .time file is missing.
+        if have_scene_ts:
+            j = int(np.searchsorted(scene_ts, ts_ns))
+            if j >= scene_ts.size:
+                j = scene_ts.size - 1
+            elif j > 0 and abs(int(scene_ts[j - 1]) - ts_ns) <= abs(int(scene_ts[j]) - ts_ns):
+                j -= 1
+            H = homographies.get(j)
+        else:
+            H = homographies.get(frame_i)
+        if H is None:
+            return None, None
+        mapped = cv2.perspectiveTransform(np.array([[[x, y]]], dtype=np.float32), H)
+        px_p, py_p = float(mapped[0][0][0]), float(mapped[0][0][1])
+        if 0 <= px_p <= 1 and 0 <= py_p <= 1:
+            return px_p, py_p
+        return None, None
+
+    return project
+
+
+def _write_predictions(dirs: list, recording_id: str, samples: list, project) -> tuple:
+    """Project ``(timestamp_ns, scene_x, scene_y)`` samples and write the CSV.
+
+    Written to every directory in `dirs` — the cloud sources share one projection.
+    Returns ``(n_samples, n_on_paper)``."""
+    import csv
+    rows = []
+    on_paper = 0
+    for i, (ts_ns, x, y) in enumerate(samples):
+        paper_x, paper_y = project(ts_ns, x, y, i)
+        if paper_x is not None:
+            on_paper += 1
+        rows.append({
+            "recording id": recording_id,
+            "timestamp_ns": int(ts_ns),
+            "pred_gaze_x": round(float(x), 2),
+            "pred_gaze_y": round(float(y), 2),
+            "paper_x": round(paper_x, 4) if paper_x is not None else None,
+            "paper_y": round(paper_y, 4) if paper_y is not None else None,
+        })
+
+    for d in dirs:
+        with open(d / "gaze_predictions.csv", "w", newline="") as f:
+            # "recording id" leads so rows stay traceable once merged across recordings.
+            writer = csv.DictWriter(f, fieldnames=_PREDICTION_COLS)
+            writer.writeheader()
+            writer.writerows(rows)
+    return len(rows), on_paper
+
+
+async def _mark_gaze_result(recording_id: str) -> None:
+    db = await get_db()
+    try:
+        await db.execute("UPDATE recordings SET has_gaze_result = 1 WHERE id = ?", (recording_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+def _load_cloud_gaze(folder_path: str) -> list:
+    """``(timestamp_ns, x, y)`` scene-px samples from Pupil Cloud's gaze export."""
+    import csv as csv_mod
+    rows = []
+    with open(_cloud_gaze_path(folder_path)) as f:
+        for row in csv_mod.DictReader(f):
+            try:
+                rows.append((int(row["timestamp_ns"]), float(row["x"]), float(row["y"])))
+            except (KeyError, TypeError, ValueError):
+                continue  # skip rows with missing/blank gaze
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def _resample_to_scene_grid(folder_path: str, samples: list) -> list:
+    """Reduce Pupil Cloud's ~200 Hz gaze to the 30-fps grid our own pipeline uses.
+
+    Without this the sources are not comparable: I-DT on 200 Hz input with the same
+    thresholds returns a different fixation count for reasons that have nothing to
+    do with gaze quality. It is the same grid `_build_clean_30fps` puts pupils on,
+    so the two sources end up on identical timestamps. Each tick takes the MEDIAN of
+    the samples within half a frame of it; ticks without a sample are dropped."""
+    import pandas as pd
+    ts = np.array([s[0] for s in samples], dtype=np.int64)
+    xs = np.array([s[1] for s in samples], dtype=np.float64)
+    ys = np.array([s[2] for s in samples], dtype=np.float64)
+    grid, half_win = _scene_grid(folder_path, pd.DataFrame({"timestamp_ns": ts}))
+
+    lo = np.searchsorted(ts, grid - half_win, side="left")
+    hi = np.searchsorted(ts, grid + half_win, side="right")
+    return [
+        (int(t), float(np.median(xs[a:b])), float(np.median(ys[a:b])))
+        for t, a, b in zip(grid, lo, hi) if b > a
+    ]
+
+
+async def _map_cloud_gaze(rec: dict, recording_id: str, resample: bool) -> dict:
+    """Step 3 for the cloud sources: project Pupil Cloud's gaze onto the surface.
+
+    No pupil detection or calibration is involved — the gaze already lives in scene
+    pixels, so only the surface projection is left. Both cloud sources use the same
+    gaze, so the result is written to both leaves."""
+    folder_path = rec["folder_path"]
+    if not _cloud_gaze_path(folder_path).exists():
+        raise HTTPException(status_code=400, detail="No Pupil Cloud gaze export (csv/gaze.csv) in this recording")
+
+    raw = _load_cloud_gaze(folder_path)
+    if not raw:
+        raise HTTPException(status_code=400, detail="Pupil Cloud gaze export has no usable samples")
+    samples = _resample_to_scene_grid(folder_path, raw) if resample else raw
+    if not samples:
+        raise HTTPException(status_code=400, detail="No Pupil Cloud gaze samples overlap the scene timeline")
+
+    project = _make_paper_projector(rec)
+    dirs = [_gaze_dir(folder_path, s) for s in CLOUD_SOURCES]
+    total, on_paper = _write_predictions(dirs, recording_id, samples, project)
+    await _mark_gaze_result(recording_id)
+
+    result = {
+        # No model is fitted here, so there is no calibration error to report.
+        "mean_rmse": None,
+        "residuals": [],
+        "frames_with_gaze": total,
+        "frames_on_paper": on_paper,
+        "total_frames": total,
+        "n_cloud_samples": len(raw),
+        "resampled": resample,
+    }
+    payload = json.dumps(result, indent=2)
+    for d in dirs:
+        (d / "mapping_result.json").write_text(payload)
+    return result
+
+
 @router.post("/map")
-async def map_gaze(recording_id: str):
+async def map_gaze(recording_id: str, source: Optional[str] = None, resample_30fps: bool = True):
     rec = await _get_recording(recording_id)
-    gdir = _gaze_dir(rec["folder_path"])
+    src = active_source(rec["folder_path"], source)
+    if src in CLOUD_SOURCES:
+        return await _map_cloud_gaze(rec, recording_id, resample_30fps)
+
+    gdir = _gaze_dir(rec["folder_path"], src)
     folder_path = rec["folder_path"]
 
     pupils_csv = gdir / "pupils.csv"
@@ -1169,78 +1396,17 @@ async def map_gaze(recording_id: str):
     pupils["pred_gaze_x"] = pred[:, 0]
     pupils["pred_gaze_y"] = pred[:, 1]
 
-    # ── 9. AprilTag homography (optional) ──────────────────────────────────
-    # Uses the AoI editor's surface registry so paper gaze shares its coordinate
-    # system (same tag OUTER-corner homography, any tag IDs, 3+ tags).
-    scene_path = rec.get("scene_video")
-    if scene_path:
-        registry = _build_recording_registry(_aoi_dir(folder_path), scene_path)
-        scene_ts, homographies = _build_homographies(scene_path, registry)
-    else:
-        scene_ts, homographies = np.array([], dtype=np.int64), {}
-    have_scene_ts = scene_ts.size > 0
-
-    frames_with_gaze = 0
-    frames_on_paper = 0
-    out_rows = []
-
-    for frame_i, pupil_row in pupils.iterrows():
-        px = float(pupil_row["pred_gaze_x"])
-        py = float(pupil_row["pred_gaze_y"])
-        ts_ns = int(pupil_row["timestamp_ns"])
-        frames_with_gaze += 1
-
-        paper_x: Optional[float] = None
-        paper_y: Optional[float] = None
-
-        # Match the scene frame by NEAREST TIMESTAMP (not positional index): the
-        # pupil 30-fps grid and the scene video are separate streams with a ~4-frame
-        # start offset. Fall back to index only if the scene .time file is missing.
-        if have_scene_ts:
-            j = int(np.searchsorted(scene_ts, ts_ns))
-            if j >= scene_ts.size:
-                j = scene_ts.size - 1
-            elif j > 0 and abs(int(scene_ts[j - 1]) - ts_ns) <= abs(int(scene_ts[j]) - ts_ns):
-                j -= 1
-            H = homographies.get(j)
-        else:
-            H = homographies.get(frame_i)
-        if H is not None:
-            pt = np.array([[[px, py]]], dtype=np.float32)
-            mapped = cv2.perspectiveTransform(pt, H)
-            px_p, py_p = float(mapped[0][0][0]), float(mapped[0][0][1])
-            if 0 <= px_p <= 1 and 0 <= py_p <= 1:
-                paper_x = px_p
-                paper_y = py_p
-                frames_on_paper += 1
-
-        out_rows.append({
-            "recording id": recording_id,
-            "timestamp_ns": ts_ns,
-            "pred_gaze_x": round(px, 2),
-            "pred_gaze_y": round(py, 2),
-            "paper_x": round(paper_x, 4) if paper_x is not None else None,
-            "paper_y": round(paper_y, 4) if paper_y is not None else None,
-        })
-
-    import csv
-    out_csv = gdir / "gaze_predictions.csv"
-    with open(out_csv, "w", newline="") as f:
-        # "recording id" leads so rows stay traceable once merged across recordings.
-        writer = csv.DictWriter(
-            f, fieldnames=["recording id", "timestamp_ns", "pred_gaze_x", "pred_gaze_y", "paper_x", "paper_y"],
-        )
-        writer.writeheader()
-        writer.writerows(out_rows)
-
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE recordings SET has_gaze_result = 1 WHERE id = ?", (recording_id,)
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    # ── 9. Project onto the paper surface and write the predictions ────────
+    pupils = pupils.reset_index(drop=True)
+    samples = list(zip(
+        pupils["timestamp_ns"].astype(np.int64).tolist(),
+        pupils["pred_gaze_x"].tolist(),
+        pupils["pred_gaze_y"].tolist(),
+    ))
+    frames_with_gaze, frames_on_paper = _write_predictions(
+        [gdir], recording_id, samples, _make_paper_projector(rec)
+    )
+    await _mark_gaze_result(recording_id)
 
     result = {
         "mean_rmse": mean_rmse,                    # leave-one-out (honest)
@@ -1258,10 +1424,10 @@ async def map_gaze(recording_id: str):
 
 
 @router.get("/map/result")
-async def get_map_result(recording_id: str):
+async def get_map_result(recording_id: str, source: Optional[str] = None):
     """Return the stats from the last completed gaze mapping, if any."""
     rec = await _get_recording(recording_id)
-    gdir = _gaze_dir(rec["folder_path"])
+    gdir = _gaze_dir(rec["folder_path"], active_source(rec["folder_path"], source))
     f = gdir / "mapping_result.json"
     if not f.exists():
         return None
@@ -1359,16 +1525,9 @@ def _detect_fixations_idt(samples: list, disp_thresh_px: float, min_dur_ns: int,
     return fixations
 
 
-@router.post("/fixations")
-async def compute_fixations(recording_id: str, req: FixationRequest):
+def _read_prediction_samples(pred_csv: Path) -> list:
+    """Mapped gaze as time-ordered ``(ts_ns, x_px, y_px, paper_x|None, paper_y|None)``."""
     import csv as csv_mod
-    import uuid
-
-    rec = await _get_recording(recording_id)
-    gdir = _gaze_dir(rec["folder_path"])
-    pred_csv = gdir / "gaze_predictions.csv"
-    if not pred_csv.exists():
-        raise HTTPException(status_code=400, detail="Run gaze mapping first")
 
     def _fp(v):
         return float(v) if v not in (None, "", "None", "null") else None
@@ -1381,27 +1540,40 @@ async def compute_fixations(recording_id: str, req: FixationRequest):
                 float(row["pred_gaze_x"]), float(row["pred_gaze_y"]),
                 _fp(row.get("paper_x")), _fp(row.get("paper_y")),
             ))
-    if len(samples) < 2:
-        raise HTTPException(status_code=400, detail="Not enough gaze samples")
     samples.sort(key=lambda s: s[0])
+    return samples
 
-    disp_px = req.max_dispersion_deg * _SCENE_PX_PER_DEG
-    min_dur_ns = int(req.min_duration_ms * 1e6)
-    max_gap_ns = int(req.max_gap_ms * 1e6)
-    fixations = _detect_fixations_idt(samples, disp_px, min_dur_ns, max_gap_ns)
 
-    # One default section per recording (stable across recomputes). Pupil uses a
-    # section per enrichment/time-range; we have no segments yet, so span the whole
-    # recording with a deterministic id derived from the recording id.
-    section_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"fixations:{recording_id}"))
+def _section_id(recording_id: str) -> str:
+    """One default section per recording, stable across recomputes.
+
+    Pupil uses a section per enrichment/time-range; we have no segments here, so a
+    single deterministic id derived from the recording id spans the whole thing."""
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"fixations:{recording_id}"))
+
+
+_FIXATION_COLS = [
+    "section id", "recording id", "fixation id",
+    "start timestamp [ns]", "end timestamp [ns]", "duration [ms]",
+    "fixation x [px]", "fixation y [px]",
+]
+_SURFACE_FIXATION_COLS = [
+    "section id", "recording id", "fixation id",
+    "start timestamp [ns]", "end timestamp [ns]", "duration [ms]",
+    "fixation detected on surface",
+    "fixation x [normalized]", "fixation y [normalized]",
+]
+
+
+def _write_fixations(gdir: Path, recording_id: str, fixations: list) -> None:
+    """Write the Pupil-compatible fixation pair for one source's directory."""
+    import csv as csv_mod
+    section_id = _section_id(recording_id)
 
     with open(gdir / "fixations.csv", "w", newline="") as f:
         w = csv_mod.writer(f)
-        w.writerow([
-            "section id", "recording id", "fixation id",
-            "start timestamp [ns]", "end timestamp [ns]", "duration [ms]",
-            "fixation x [px]", "fixation y [px]",
-        ])
+        w.writerow(_FIXATION_COLS)
         for fx in fixations:
             w.writerow([
                 section_id, recording_id, fx["fixation_id"],
@@ -1411,12 +1583,7 @@ async def compute_fixations(recording_id: str, req: FixationRequest):
 
     with open(gdir / "fixations_on_surface.csv", "w", newline="") as f:
         w = csv_mod.writer(f)
-        w.writerow([
-            "section id", "recording id", "fixation id",
-            "start timestamp [ns]", "end timestamp [ns]", "duration [ms]",
-            "fixation detected on surface",
-            "fixation x [normalized]", "fixation y [normalized]",
-        ])
+        w.writerow(_SURFACE_FIXATION_COLS)
         for fx in fixations:
             has_norm = fx["on_surface"] and fx["norm_x"] is not None
             w.writerow([
@@ -1427,10 +1594,12 @@ async def compute_fixations(recording_id: str, req: FixationRequest):
                 round(fx["norm_y"], 4) if has_norm else "",
             ])
 
+
+def _fixation_stats(fixations: list, span_ns: int) -> dict:
     durs = [fx["duration_ms"] for fx in fixations]
-    total_span = (samples[-1][0] - samples[0][0]) / 1e9
     n_on = sum(1 for fx in fixations if fx["on_surface"])
-    result = {
+    total_span = span_ns / 1e9
+    return {
         "n_fixations": len(fixations),
         "mean_duration_ms": float(np.mean(durs)) if durs else 0.0,
         "median_duration_ms": float(np.median(durs)) if durs else 0.0,
@@ -1438,6 +1607,102 @@ async def compute_fixations(recording_id: str, req: FixationRequest):
         "pct_time_fixating": float(sum(durs) / 1000 / total_span * 100) if total_span > 0 else 0.0,
         "n_on_surface": n_on,
         "pct_on_surface": float(n_on / len(fixations) * 100) if fixations else 0.0,
+    }
+
+
+def _import_cloud_fixations(rec: dict, recording_id: str) -> dict:
+    """Step 4 for the cloud_native source: take Pupil Cloud's own fixations as-is.
+
+    Pupil's export has no surface coordinates. Rather than localizing the surface
+    again — a full AprilTag pass over the scene video — this reuses the paper
+    coordinates step 3 already wrote per sample, aggregated over each fixation's
+    window exactly the way `_make_fixation` does for our own fixations. Same rule
+    for both sources, and no second video scan."""
+    import csv as csv_mod
+
+    folder_path = rec["folder_path"]
+    src_csv = _cloud_fixations_path(folder_path)
+    if not src_csv.exists():
+        raise HTTPException(status_code=400, detail="No Pupil Cloud fixation export (csv/fixations.csv) in this recording")
+
+    gdir = _gaze_dir(folder_path, "cloud_native")
+    pred_csv = gdir / "gaze_predictions.csv"
+    if not pred_csv.exists():
+        raise HTTPException(status_code=400, detail="Run gaze mapping first")
+
+    samples = _read_prediction_samples(pred_csv)
+    if not samples:
+        raise HTTPException(status_code=400, detail="Mapped gaze has no samples")
+    sample_ts = np.array([s[0] for s in samples], dtype=np.int64)
+
+    fixations = []
+    with open(src_csv) as f:
+        for row in csv_mod.DictReader(f):
+            # event_type 1 = fixation, 2 = saccade — only fixations are wanted here.
+            try:
+                if int(row["event_type"]) != 1:
+                    continue
+                start_ts, end_ts = int(row["start_timestamp_ns"]), int(row["end_timestamp_ns"])
+                x, y = float(row["mean_gaze_x"]), float(row["mean_gaze_y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            lo = int(np.searchsorted(sample_ts, start_ts, side="left"))
+            hi = int(np.searchsorted(sample_ts, end_ts, side="right"))
+            members = samples[lo:hi]
+            # paper_x/y are set only where the gaze mapped inside the surface, so a
+            # fixation counts as on-surface when at least half its samples did.
+            px = [m[3] for m in members if m[3] is not None and m[4] is not None]
+            py = [m[4] for m in members if m[3] is not None and m[4] is not None]
+            on_surface = bool(members) and len(px) >= max(1, len(members) / 2)
+
+            fixations.append({
+                "fixation_id": len(fixations) + 1,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "duration_ms": (end_ts - start_ts) / 1e6,
+                # Pupil's own centroid is kept — only the surface annotation is ours.
+                "x_px": x, "y_px": y,
+                "on_surface": on_surface,
+                "norm_x": float(np.mean(px)) if px else None,
+                "norm_y": float(np.mean(py)) if py else None,
+            })
+
+    if not fixations:
+        raise HTTPException(status_code=400, detail="Pupil Cloud fixation export has no fixation rows")
+
+    _write_fixations(gdir, recording_id, fixations)
+    span = fixations[-1]["end_ts"] - fixations[0]["start_ts"]
+    result = {**_fixation_stats(fixations, span), "imported_from_cloud": True}
+    (gdir / "fixations_result.json").write_text(json.dumps(result, indent=2))
+    return result
+
+
+@router.post("/fixations")
+async def compute_fixations(recording_id: str, req: FixationRequest, source: Optional[str] = None):
+    rec = await _get_recording(recording_id)
+    src = active_source(rec["folder_path"], source)
+    if src == "cloud_native":
+        return _import_cloud_fixations(rec, recording_id)
+
+    gdir = _gaze_dir(rec["folder_path"], src)
+    pred_csv = gdir / "gaze_predictions.csv"
+    if not pred_csv.exists():
+        raise HTTPException(status_code=400, detail="Run gaze mapping first")
+
+    samples = _read_prediction_samples(pred_csv)
+    if len(samples) < 2:
+        raise HTTPException(status_code=400, detail="Not enough gaze samples")
+
+    disp_px = req.max_dispersion_deg * _SCENE_PX_PER_DEG
+    min_dur_ns = int(req.min_duration_ms * 1e6)
+    max_gap_ns = int(req.max_gap_ms * 1e6)
+    fixations = _detect_fixations_idt(samples, disp_px, min_dur_ns, max_gap_ns)
+
+    _write_fixations(gdir, recording_id, fixations)
+
+    result = {
+        **_fixation_stats(fixations, samples[-1][0] - samples[0][0]),
         "max_dispersion_deg": req.max_dispersion_deg,
         "min_duration_ms": req.min_duration_ms,
         "max_gap_ms": req.max_gap_ms,
@@ -1447,10 +1712,10 @@ async def compute_fixations(recording_id: str, req: FixationRequest):
 
 
 @router.get("/fixations/result")
-async def get_fixations_result(recording_id: str):
+async def get_fixations_result(recording_id: str, source: Optional[str] = None):
     """Summary stats from the last completed fixation detection, if any."""
     rec = await _get_recording(recording_id)
-    gdir = _gaze_dir(rec["folder_path"])
+    gdir = _gaze_dir(rec["folder_path"], active_source(rec["folder_path"], source))
     f = gdir / "fixations_result.json"
     if not f.exists():
         return None
@@ -1458,10 +1723,10 @@ async def get_fixations_result(recording_id: str):
 
 
 @router.get("/fixations")
-async def get_fixations(recording_id: str):
+async def get_fixations(recording_id: str, source: Optional[str] = None):
     """Fixations with both scene-px and (when available) surface coords, for overlays."""
     rec = await _get_recording(recording_id)
-    gdir = _gaze_dir(rec["folder_path"])
+    gdir = _gaze_dir(rec["folder_path"], active_source(rec["folder_path"], source))
     csv_path = gdir / "fixations.csv"
     if not csv_path.exists():
         return []
@@ -1494,6 +1759,21 @@ async def get_fixations(recording_id: str):
                 "norm_y": _fp(s.get("fixation y [normalized]")),
             })
     return rows
+
+
+@router.get("/scene-timestamps")
+async def get_scene_timestamps(recording_id: str):
+    """Device timestamp (ns) of every scene-video frame, in playback order.
+
+    Lets the player turn a playback position into a real frame index — and from
+    there into the gaze clock — instead of guessing by fraction of the clip. Every
+    per-frame product (surface positions, scene motion) is indexed the same way."""
+    rec = await _get_recording(recording_id)
+    scene_path = rec.get("scene_video")
+    if not scene_path or not Path(scene_path).exists():
+        raise HTTPException(status_code=404, detail="Scene video not found")
+    ts = _load_scene_timestamps(scene_path)
+    return {"ts_ns": [int(t) for t in ts]}
 
 
 def _load_scene_timestamps(scene_path: str) -> np.ndarray:
@@ -1545,9 +1825,9 @@ def _build_homographies(scene_path: str, registry: Optional[dict]) -> tuple[np.n
 # ── predictions (for player overlay) ──────────────────────────────────────
 
 @router.get("/predictions")
-async def get_predictions(recording_id: str):
+async def get_predictions(recording_id: str, source: Optional[str] = None):
     rec = await _get_recording(recording_id)
-    gdir = _gaze_dir(rec["folder_path"])
+    gdir = _gaze_dir(rec["folder_path"], active_source(rec["folder_path"], source))
     csv_path = gdir / "gaze_predictions.csv"
     if not csv_path.exists():
         return []
@@ -1565,6 +1845,19 @@ async def get_predictions(recording_id: str):
                 "paper_y": float(row["paper_y"]) if row["paper_y"] not in ("", "None", "null") else None,
             })
     return rows
+
+
+@router.get("/cloud")
+async def get_cloud_gaze(recording_id: str):
+    """Pupil Cloud's own gaze samples (``csv/gaze.csv``) in scene-camera pixels.
+
+    Returned in the same shape as ``/predictions`` so the player can drive both
+    overlays through one code path. Always the raw export, independent of which
+    source the recording is analysed from — it is the reference overlay."""
+    rec = await _get_recording(recording_id)
+    if not _cloud_gaze_path(rec["folder_path"]).exists():
+        return []
+    return [{"timestamp_ns": ts, "x": x, "y": y} for ts, x, y in _load_cloud_gaze(rec["folder_path"])]
 
 
 @router.get("/pupils")

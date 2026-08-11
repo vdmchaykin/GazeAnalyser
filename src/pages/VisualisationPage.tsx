@@ -4,6 +4,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
 import { formatDuration, formatDate } from "@/lib/utils";
 import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
+import { GazeSourceBadge } from "@/components/gaze/GazeSourceBadge";
 import type { RecordingMeta, RecordingEvent, GazePrediction, Fixation } from "@/types";
 
 // Surface (warped paper) canvas resolution — shared with AoI / Surface Map so
@@ -558,6 +559,8 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
         <span className="text-zinc-700">|</span>
         <span className="text-sm font-medium text-white">{recording.name}</span>
         {recording.wearer_name && <span className="text-xs text-zinc-500">{recording.wearer_name}</span>}
+        <div className="flex-1" />
+        <GazeSourceBadge recordingId={recording.id} />
       </div>
 
       {/* Mode switch + mode controls */}

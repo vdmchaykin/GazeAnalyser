@@ -5,7 +5,7 @@ import { api } from "@/lib/api";
 import { confirmDialog } from "@/components/ConfirmDialog";
 import { formatDuration, formatDate } from "@/lib/utils";
 import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
-import type { NavPage, Project, RecordingMeta } from "@/types";
+import { GAZE_SOURCE_LABELS, type GazeSource, type NavPage, type Project, type RecordingMeta } from "@/types";
 
 interface ExportFile {
   name: string;
@@ -20,6 +20,8 @@ interface ExportFile {
 interface Manifest {
   is_project: boolean;
   n_recordings: number;
+  /** Gaze sources the selected recordings are analysed from — usually just one. */
+  sources: GazeSource[];
   files: ExportFile[];
 }
 
@@ -217,6 +219,14 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
                       ? `Project · ${manifest.n_recordings} recordings merged into one CSV per file`
                       : "Single recording"
                     : "Loading…"}
+                  {/* Gaze-derived files come from whichever source each recording is
+                      analysed from, so name it rather than exporting silently. */}
+                  {manifest && manifest.sources.length > 0 && (
+                    <span className="text-zinc-600">
+                      {" · Gaze source: "}
+                      {manifest.sources.map((s) => GAZE_SOURCE_LABELS[s]).join(", ")}
+                    </span>
+                  )}
                 </p>
               </div>
 

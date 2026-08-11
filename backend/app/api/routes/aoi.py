@@ -46,10 +46,65 @@ def _aoi_dir(folder_path: str) -> Path:
     return d
 
 
-def _gaze_dir(folder_path: str) -> Path:
-    d = Path(folder_path) / "gaze_analysis"
+# ── gaze source ────────────────────────────────────────────────────────────
+# A recording can be analysed from three sources. Each keeps its own copy of the
+# derived files in a leaf directory, so switching never overwrites another
+# source's results and the pipelines stay comparable side by side:
+#   own           our pupil detection + calibration + our I-DT fixations
+#   cloud         Pupil Cloud's gaze (csv/gaze.csv) + our I-DT fixations
+#   cloud_native  Pupil Cloud's gaze + Pupil Cloud's fixations (csv/fixations.csv)
+# Filenames inside a leaf are identical across sources, so everything downstream
+# only ever needs the right directory.
+GAZE_SOURCES = ("own", "cloud", "cloud_native")
+_SOURCE_SUBDIR = {"own": "", "cloud": "cloud", "cloud_native": "cloud_native"}
+# The two cloud sources share one gaze projection — mapping writes it to both.
+CLOUD_SOURCES = ("cloud", "cloud_native")
+
+
+def check_source(source: str) -> str:
+    if source not in _SOURCE_SUBDIR:
+        raise HTTPException(status_code=400, detail=f"Unknown gaze source '{source}'")
+    return source
+
+
+def _gaze_dir(folder_path: str, source: str = "own") -> Path:
+    d = Path(folder_path) / "gaze_analysis" / _SOURCE_SUBDIR[check_source(source)]
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _source_file(folder_path: str) -> Path:
+    """Where the recording's selected source lives (shared by all sources)."""
+    return Path(folder_path) / "gaze_analysis" / "source.json"
+
+
+def read_source(folder_path: str) -> str:
+    """The recording's persisted gaze source, defaulting to our own pipeline."""
+    f = _source_file(folder_path)
+    if f.exists():
+        try:
+            s = json.loads(f.read_text()).get("source")
+        except (json.JSONDecodeError, OSError):
+            s = None
+        if s in _SOURCE_SUBDIR:
+            return s
+    return "own"
+
+
+def write_source(folder_path: str, source: str) -> str:
+    check_source(source)
+    p = _source_file(folder_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"source": source}))
+    return source
+
+
+def active_source(folder_path: str, override: Optional[str] = None) -> str:
+    """Which source a request works on: the explicit one, else the persisted one.
+
+    Everything downstream of the Gaze section (AoI metrics, export, player) reads
+    the persisted value, so it follows the selector without threading it through."""
+    return check_source(override) if override else read_source(folder_path)
 
 
 def _upload_source_path(adir: Path, segment_id: str) -> Path:
@@ -723,6 +778,35 @@ async def cancel_surface_positions(recording_id: str):
     return {"ok": True}
 
 
+@router.get("/surface-positions/data")
+async def surface_positions_data(recording_id: str):
+    """Per-frame surface corners for the player overlay.
+
+    ``corners[i]`` is ``[tl_x, tl_y, tr_x, tr_y, br_x, br_y, bl_x, bl_y]`` in scene
+    pixels, or null where the surface was not localizable in that frame. Together
+    with a fixation's normalized surface position this pins the fixation to the
+    paper exactly, with no drift — the same homography the AoI export is built on,
+    just evaluated in the direction normalized → scene."""
+    rec = await _get_recording(recording_id)
+    path = _aoi_dir(rec["folder_path"]) / "surface_positions.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="surface_positions.csv not found")
+
+    ts_ns: list = []
+    corners: list = []
+    localized = 0
+    corner_cols = _SURFACE_COLS[3:]
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            ts_ns.append(int(row["timestamp [ns]"]) if row["timestamp [ns]"] else None)
+            if row[corner_cols[0]] == "":
+                corners.append(None)
+                continue
+            corners.append([float(row[c]) for c in corner_cols])
+            localized += 1
+    return {"ts_ns": ts_ns, "corners": corners, "frames": len(corners), "localized": localized}
+
+
 @router.get("/surface-positions/file")
 async def download_surface_positions(recording_id: str):
     rec = await _get_recording(recording_id)
@@ -761,14 +845,18 @@ _AOI_EXPORT_STEMS = ("aoi_fixations", "aoi_metrics")
 _RESERVED_AOI_JSON = {"surface", "segments", "state"}
 
 
-def _aoi_export_path(adir: Path, stem: str) -> Path:
-    return adir / f"{stem}.csv"
+def _aoi_export_path(adir: Path, stem: str, source: str = "own") -> Path:
+    """Metrics are gaze-derived, so each source gets its own copy (see GAZE_SOURCES)."""
+    return adir / _SOURCE_SUBDIR[check_source(source)] / f"{stem}.csv"
 
 
 def _invalidate_aoi_metrics(adir: Path) -> None:
-    """Drop the exports once any segment's AoI shapes change (they no longer match)."""
-    for stem in _AOI_EXPORT_STEMS:
-        _aoi_export_path(adir, stem).unlink(missing_ok=True)
+    """Drop the exports once any segment's AoI shapes change (they no longer match).
+
+    Shapes are shared by every source, so all of their metrics go stale at once."""
+    for source in GAZE_SOURCES:
+        for stem in _AOI_EXPORT_STEMS:
+            _aoi_export_path(adir, stem, source).unlink(missing_ok=True)
 
 
 def _list_aoi_segments(adir: Path) -> List[str]:
@@ -842,10 +930,11 @@ def _read_surface_fixations(gdir: Path) -> List[dict]:
 
 
 @router.post("/aoi-metrics")
-async def generate_aoi_metrics(recording_id: str):
+async def generate_aoi_metrics(recording_id: str, source: Optional[str] = None):
     rec = await _get_recording(recording_id)
     adir = _aoi_dir(rec["folder_path"])
-    gdir = _gaze_dir(rec["folder_path"])
+    src = active_source(rec["folder_path"], source)
+    gdir = _gaze_dir(rec["folder_path"], src)
 
     if not (gdir / "fixations_on_surface.csv").exists():
         raise HTTPException(
@@ -876,7 +965,8 @@ async def generate_aoi_metrics(recording_id: str):
                 fx for fx in fixations if _point_in_shape(fx["x"], fx["y"], a["shape"])
             ]
 
-    with open(_aoi_export_path(adir, "aoi_fixations"), "w", newline="") as f:
+    _aoi_export_path(adir, "aoi_fixations", src).parent.mkdir(parents=True, exist_ok=True)
+    with open(_aoi_export_path(adir, "aoi_fixations", src), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(_AOI_FIXATION_COLS)
         for sid, areas in segments:
@@ -887,7 +977,7 @@ async def generate_aoi_metrics(recording_id: str):
                         fx["fixation_id"], round(fx["duration_ms"]), sid,
                     ])
 
-    with open(_aoi_export_path(adir, "aoi_metrics"), "w", newline="") as f:
+    with open(_aoi_export_path(adir, "aoi_metrics", src), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(_AOI_METRICS_COLS)
         for sid, areas in segments:
@@ -910,6 +1000,7 @@ async def generate_aoi_metrics(recording_id: str):
 
     n_areas = sum(len(areas) for _, areas in segments)
     return {
+        "source": src,
         "n_segments": len(segments),
         "n_areas": n_areas,
         "n_areas_fixated": sum(1 for v in hits.values() if v),
@@ -919,25 +1010,28 @@ async def generate_aoi_metrics(recording_id: str):
 
 
 @router.get("/aoi-metrics")
-async def aoi_metrics_status(recording_id: str):
+async def aoi_metrics_status(recording_id: str, source: Optional[str] = None):
     rec = await _get_recording(recording_id)
     adir = _aoi_dir(rec["folder_path"])
-    gdir = _gaze_dir(rec["folder_path"])
+    src = active_source(rec["folder_path"], source)
+    gdir = _gaze_dir(rec["folder_path"], src)
     segments = _segment_areas(adir)
     return {
+        "source": src,
         "has_fixations": (gdir / "fixations_on_surface.csv").exists(),
         "n_segments": len(segments),
         "n_areas": sum(len(areas) for _, areas in segments),
-        "has_file": all(_aoi_export_path(adir, stem).exists() for stem in _AOI_EXPORT_STEMS),
+        "has_file": all(_aoi_export_path(adir, stem, src).exists() for stem in _AOI_EXPORT_STEMS),
     }
 
 
 @router.get("/aoi-metrics/file/{name}")
-async def download_aoi_metrics(recording_id: str, name: str):
+async def download_aoi_metrics(recording_id: str, name: str, source: Optional[str] = None):
     if name not in _AOI_EXPORT_STEMS:
         raise HTTPException(status_code=404, detail="Unknown file")
     rec = await _get_recording(recording_id)
-    path = _aoi_export_path(_aoi_dir(rec["folder_path"]), name)
+    src = active_source(rec["folder_path"], source)
+    path = _aoi_export_path(_aoi_dir(rec["folder_path"]), name, src)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"{name}.csv not found")
     return FileResponse(str(path), media_type="text/csv", filename=f"{name}.csv")

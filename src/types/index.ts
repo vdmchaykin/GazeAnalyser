@@ -24,6 +24,28 @@ export interface Project {
 
 export type GazeStep = "detect" | "calibrate" | "map" | "fixations";
 
+/**
+ * Which gaze a recording is analysed from. Each source keeps its own copy of the
+ * derived files, so switching never overwrites another source's results:
+ *   own           our pupil detection + calibration + our I-DT fixations
+ *   cloud         Pupil Cloud's gaze + our I-DT fixations
+ *   cloud_native  Pupil Cloud's gaze + Pupil Cloud's own fixations
+ */
+export type GazeSource = "own" | "cloud" | "cloud_native";
+
+export const GAZE_SOURCE_LABELS: Record<GazeSource, string> = {
+  own: "My pipeline",
+  cloud: "Cloud gaze + my fixations",
+  cloud_native: "Pupil Cloud",
+};
+
+/** Steps a source actually runs — the cloud ones ship gaze instead of deriving it. */
+export const GAZE_SOURCE_STEPS: Record<GazeSource, GazeStep[]> = {
+  own: ["detect", "calibrate", "map", "fixations"],
+  cloud: ["map", "fixations"],
+  cloud_native: ["map", "fixations"],
+};
+
 export interface GazeJobStatus {
   status: "idle" | "running" | "done" | "error";
   progress?: number;
@@ -46,6 +68,13 @@ export interface GazePrediction {
   paper_y: number | null;
 }
 
+/** A gaze sample from Pupil Cloud's own export (csv/gaze.csv), in scene-camera pixels. */
+export interface CloudGaze {
+  timestamp_ns: number;
+  x: number;
+  y: number;
+}
+
 export interface PupilData {
   timestamp_ns: number;
   xL: number | null;
@@ -65,10 +94,16 @@ export interface PupilData {
 }
 
 export interface GazeAnalysisState {
+  /** The source these flags describe — each has its own set of derived files. */
+  source: GazeSource;
+  /** Sources this recording has the input data for (always includes "own"). */
+  available_sources: GazeSource[];
   pupils_done: boolean;
   calibration_done: boolean;
   mapping_done: boolean;
   fixations_done: boolean;
+  cloud_gaze_done: boolean;
+  cloud_fixations_done: boolean;
   calibration_points: CalibrationPoint[];
 }
 
@@ -92,9 +127,36 @@ export interface FixationResult {
   pct_time_fixating: number;
   n_on_surface: number;
   pct_on_surface: number;
-  max_dispersion_deg: number;
-  min_duration_ms: number;
-  max_gap_ms: number;
+  // I-DT parameters — absent when the fixations were imported from Pupil Cloud.
+  max_dispersion_deg?: number;
+  min_duration_ms?: number;
+  max_gap_ms?: number;
+  imported_from_cloud?: boolean;
+}
+
+/** Per-scene-frame surface corners `[tl,tr,br,bl]` in scene px (null = not localized). */
+export interface SurfacePositionsData {
+  ts_ns: (number | null)[];
+  corners: (number[] | null)[];
+  frames: number;
+  localized: number;
+}
+
+/** Per-frame egomotion: `h[i]` maps frame `i-1` onto frame `i` (null = unsolved). */
+export interface SceneMotionData {
+  ts_ns: (number | null)[];
+  h: (number[] | null)[];
+  frames: number;
+  solved: number;
+}
+
+export interface SceneMotionStatus {
+  status: "idle" | "running" | "done" | "error" | "cancelled";
+  progress: number;
+  total: number;
+  solved: number;
+  message?: string;
+  has_file: boolean;
 }
 
 export interface ProjectRef {
