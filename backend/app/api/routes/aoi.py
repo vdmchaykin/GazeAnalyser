@@ -28,6 +28,104 @@ OUTPUT_W, OUTPUT_H = 794, 1123
 _SEGMENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
+# ─── Scene camera intrinsics (lens distortion) ────────────────────────────────
+# The scene camera is a wide-angle lens: straight lines bow, and AprilTag corners
+# detected in the raw frame do NOT lie on a projective image of the paper plane. A
+# homography fitted to those corners is therefore exact only at the corners and
+# wrong in between — measured on these recordings: ~8 px median, up to 45 px on the
+# A4 render, always zero at the tags and bulging in the middle.
+#
+# Every Neon recording ships the factory lens calibration, so the fix is to work in
+# ideal pinhole coordinates: undistort tag corners and gaze before fitting/using the
+# homography. Points that must stay drawable on the raw video (surface_positions.csv
+# corners, the gaze the player overlays) are distorted back.
+
+_CALIB_DTYPE = np.dtype([
+    ("version", "u1"), ("serial", "S6"),
+    ("scene_camera_matrix", "(3,3)d"), ("scene_distortion_coefficients", "(8,)d"),
+    ("scene_extrinsics_affine_matrix", "(4,4)d"),
+    ("right_camera_matrix", "(3,3)d"), ("right_distortion_coefficients", "(8,)d"),
+    ("right_extrinsics_affine_matrix", "(4,4)d"),
+    ("left_camera_matrix", "(3,3)d"), ("left_distortion_coefficients", "(8,)d"),
+    ("left_extrinsics_affine_matrix", "(4,4)d"), ("crc", "u4"),
+])
+
+_intrinsics_cache: dict = {}
+
+
+def scene_intrinsics(folder_path: Optional[str]):
+    """``(K, D)`` of the scene camera from the recording's ``calibration.bin``.
+
+    Returns None when the file is absent or unreadable — every caller then falls
+    back to treating the raw pixels as ideal, i.e. the previous behaviour."""
+    if not folder_path:
+        return None
+    key = str(folder_path)
+    if key in _intrinsics_cache:
+        return _intrinsics_cache[key]
+    result = None
+    try:
+        path = next(Path(folder_path).glob("**/calibration.bin"))
+        cal = np.fromfile(str(path), dtype=_CALIB_DTYPE)[0]
+        K = np.array(cal["scene_camera_matrix"], dtype=np.float64)
+        D = np.array(cal["scene_distortion_coefficients"], dtype=np.float64)
+        if np.isfinite(K).all() and np.isfinite(D).all() and 200 < K[0, 0] < 5000:
+            result = (K, D)
+    except (StopIteration, OSError, ValueError, IndexError):
+        result = None
+    _intrinsics_cache[key] = result
+    return result
+
+
+def undistort_points(folder_path: Optional[str], pts) -> np.ndarray:
+    """Raw sensor pixels → ideal pinhole pixels (same camera matrix)."""
+    arr = np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
+    kd = scene_intrinsics(folder_path)
+    if kd is None:
+        return arr.reshape(-1, 2)
+    K, D = kd
+    return cv2.undistortPoints(arr, K, D, P=K).reshape(-1, 2)
+
+
+def distort_points(folder_path: Optional[str], pts) -> np.ndarray:
+    """Ideal pinhole pixels → raw sensor pixels (inverse of :func:`undistort_points`)."""
+    arr = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    kd = scene_intrinsics(folder_path)
+    if kd is None:
+        return arr
+    K, D = kd
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    k1, k2, p1, p2, k3, k4, k5, k6 = D[:8]
+    x = (arr[:, 0] - cx) / fx
+    y = (arr[:, 1] - cy) / fy
+    r2 = x * x + y * y
+    radial = (1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3) / (1 + k4 * r2 + k5 * r2 ** 2 + k6 * r2 ** 3)
+    xd = x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+    yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+    return np.stack([xd * fx + cx, yd * fy + cy], axis=1)
+
+
+def _undistort_tags(folder_path: Optional[str], tags: List["TagInfo"]) -> List["TagInfo"]:
+    """Tags detected in a scene frame, expressed in ideal pinhole pixels."""
+    if scene_intrinsics(folder_path) is None:
+        return tags
+    out = []
+    for t in tags:
+        pts = undistort_points(folder_path, np.vstack([np.array(t.corners, dtype=np.float32),
+                                                       np.array([t.center], dtype=np.float32)]))
+        out.append(TagInfo(tag_id=t.tag_id, center=pts[4].tolist(), corners=pts[:4].tolist()))
+    return out
+
+
+def _tags_from_detections(folder_path: Optional[str], detections) -> List["TagInfo"]:
+    """Detector output → TagInfo in ideal pinhole pixels."""
+    return _undistort_tags(folder_path, [
+        TagInfo(tag_id=int(d.tag_id), center=[float(d.center[0]), float(d.center[1])],
+                corners=np.asarray(d.corners, dtype=np.float32).tolist())
+        for d in detections
+    ])
+
+
 async def _get_recording(recording_id: str) -> dict:
     db = await get_db()
     try:
@@ -115,12 +213,21 @@ def _upload_source_path(adir: Path, segment_id: str) -> Path:
     return adir / f"upload_source_{segment_id}.jpg"
 
 
+# Per-frame scene→paper homographies cached by gaze mapping so the gaze offset
+# correction can re-project without another AprilTag pass. Tied to the surface
+# definition, so it dies with it.
+FRAME_HOMOGRAPHY_CACHE = "frame_homographies.npz"
+
+# Stamped into surface.json; bumped whenever the surface geometry changes meaning.
+SURFACE_GEOMETRY = "undistorted/1"
+
+
 def _invalidate_surface(adir: Path) -> None:
     """Delete a stale surface_positions.csv (and its cached definition).
 
     The surface definition changes whenever the user re-detects/re-saves tags, so
     any previously generated positions no longer match and must be regenerated."""
-    for name in ("surface_positions.csv", "surface.json"):
+    for name in ("surface_positions.csv", "surface.json", FRAME_HOMOGRAPHY_CACHE):
         p = adir / name
         if p.exists():
             p.unlink()
@@ -179,12 +286,18 @@ class SegmentsManifest(BaseModel):
     custom_segments: List[CustomSegment] = []
 
 
-def _detect_and_warp(frame: np.ndarray, timestamp_s: float) -> dict:
+def _detect_and_warp(frame: np.ndarray, timestamp_s: float,
+                     folder_path: Optional[str] = None) -> dict:
     """Run AprilTag detection on a BGR frame and auto-warp using all detected tags.
 
     Shared by the video-frame and uploaded-image entry points so both return the
     exact same payload shape. The auto-warp here is only a first preview — the
     frontend recomputes it via /warp-from-selection whenever tags are toggled.
+
+    `folder_path` is set only for scene-video frames, whose lens distortion is
+    corrected before warping; an uploaded reference image is a flat scan/render
+    with no distortion of ours to undo. Tag coordinates are reported RAW either
+    way — the frontend draws them on the frame it was given.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     detections = _make_apriltag_detector().detect(gray)
@@ -214,7 +327,7 @@ def _detect_and_warp(frame: np.ndarray, timestamp_s: float) -> dict:
             corners=det.corners.tolist(),
         ))
 
-    warped_b64 = _warp_frame(frame, warp_tags) if len(warp_tags) >= 3 else None
+    warped_b64 = _warp_frame(frame, warp_tags, folder_path) if len(warp_tags) >= 3 else None
 
     _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
     frame_b64 = base64.b64encode(ann_buf).decode()
@@ -250,7 +363,7 @@ async def detect_frame(recording_id: str, req: DetectFrameRequest):
     finally:
         cap.release()
 
-    return _detect_and_warp(frame, req.timestamp_s)
+    return _detect_and_warp(frame, req.timestamp_s, rec["folder_path"])
 
 
 @router.post("/detect-image")
@@ -409,8 +522,19 @@ def _surface_corners_from_tags(
     return np.array(src_pts, dtype=np.float32)
 
 
-def _warp_frame(frame: np.ndarray, tags: List[TagInfo]) -> Optional[str]:
-    """Compute perspective warp from a list of tag infos; returns base64 JPEG or None."""
+def _warp_frame(frame: np.ndarray, tags: List[TagInfo],
+                folder_path: Optional[str] = None) -> Optional[str]:
+    """Compute perspective warp from a list of tag infos; returns base64 JPEG or None.
+
+    For a scene-video frame (`folder_path` given) the lens distortion is removed
+    first — from the image and from the tag corners — so this background lives in
+    the same undistorted page geometry the gaze is mapped into."""
+    kd = scene_intrinsics(folder_path)
+    if kd is not None:
+        K, D = kd
+        frame = cv2.undistort(frame, K, D)
+        tags = _undistort_tags(folder_path, tags)
+
     src_pts = _surface_corners_from_tags(tags, frame.shape[1], frame.shape[0])
     if src_pts is None:
         return None
@@ -456,7 +580,9 @@ async def warp_from_selection(recording_id: str, req: WarpSelectionRequest):
         if not ok:
             raise HTTPException(status_code=400, detail="Could not read frame")
 
-    warped_b64 = _warp_frame(frame, req.selected_tags)
+    # Only a scene frame carries our lens distortion; an uploaded image does not.
+    warped_b64 = _warp_frame(frame, req.selected_tags,
+                             None if req.source == "upload" else rec["folder_path"])
     return {"warped_image_b64": warped_b64, "success": warped_b64 is not None}
 
 
@@ -487,12 +613,16 @@ def _load_scene_timestamps(scene_path: str) -> np.ndarray:
 
 
 def _build_surface_registry(
-    selected_tags: List[TagInfo], frame_w: int, frame_h: int
+    selected_tags: List[TagInfo], frame_w: int, frame_h: int,
+    folder_path: Optional[str] = None,
 ) -> Optional[dict]:
     """Map each selected tag's 4 corners into normalised surface coords [0,1]².
 
     Returns {tag_id: [[u,v]×4]} keyed by int tag id, or None if the surface plane
-    could not be established from the given tags."""
+    could not be established from the given tags. `folder_path` marks the tags as
+    coming from a scene frame, whose distortion is removed first so the registry
+    describes the true page geometry."""
+    selected_tags = _undistort_tags(folder_path, selected_tags)
     corners = _surface_corners_from_tags(selected_tags, frame_w, frame_h)
     if corners is None:
         return None
@@ -509,16 +639,22 @@ def _build_surface_registry(
     return registry
 
 
-def _surface_scene_homography(detections, registry: dict) -> Optional[np.ndarray]:
+def _surface_scene_homography(detections, registry: dict,
+                              folder_path: Optional[str] = None) -> Optional[np.ndarray]:
     """Robust homography normalized-paper [0,1]² → scene pixels for one frame.
 
     Correspondences are (registered normalized corner → detected scene corner) for
     every visible registered marker. RANSAC (threshold in SCENE PIXELS) rejects
     wrong-plane detections — crucially, a DUPLICATE tag id from another physical
     paper reprojects to a scene location far from where it actually is, so its
-    corners fall out as outliers. Needs ≥1 registered marker (4 correspondences)."""
+    corners fall out as outliers. Needs ≥1 registered marker (4 correspondences).
+
+    With `folder_path` the detected corners are undistorted first, so the result
+    maps to IDEAL PINHOLE pixels — the space a homography can actually represent.
+    Callers that need raw sensor pixels distort the result back."""
+    tags = _tags_from_detections(folder_path, detections)
     src, dst = [], []
-    for det in detections:
+    for det in tags:
         reg = registry.get(int(det.tag_id))
         if reg is None:
             continue
@@ -536,13 +672,18 @@ def _surface_scene_homography(detections, registry: dict) -> Optional[np.ndarray
     return H  # surface (norm) -> scene px
 
 
-def _localize_surface(detections, registry: dict) -> Optional[np.ndarray]:
-    """Surface corners [TL, TR, BR, BL] in scene pixels (or None if not localized)."""
-    H = _surface_scene_homography(detections, registry)
+def _localize_surface(detections, registry: dict,
+                      folder_path: Optional[str] = None) -> Optional[np.ndarray]:
+    """Surface corners [TL, TR, BR, BL] in RAW scene pixels (or None if not localized).
+
+    Raw, not undistorted: these corners are drawn over the scene video in the
+    player and exported as Pupil's surface_positions.csv."""
+    H = _surface_scene_homography(detections, registry, folder_path)
     if H is None:
         return None
     unit = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32).reshape(-1, 1, 2)
-    return cv2.perspectiveTransform(unit, H).reshape(-1, 2)
+    corners = cv2.perspectiveTransform(unit, H).reshape(-1, 2)
+    return distort_points(folder_path, corners).astype(np.float32)
 
 
 def _run_surface_positions(
@@ -578,7 +719,7 @@ def _run_surface_positions(
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 dets = detector.detect(gray)
                 matched = sorted({int(d.tag_id) for d in dets if int(d.tag_id) in registry})
-                corners = _localize_surface(dets, registry)
+                corners = _localize_surface(dets, registry, folder_path)
                 if corners is not None:
                     vals = [f"{v:.3f}" for p in corners for v in p]
                     localized += 1
@@ -635,14 +776,18 @@ _BULK_QUAD_DECIMATE = 2.0
 _BULK_NTHREADS = 4
 
 
-def _scene_to_paper_H(detections, registry: dict) -> Optional[np.ndarray]:
+def _scene_to_paper_H(detections, registry: dict,
+                      folder_path: Optional[str] = None) -> Optional[np.ndarray]:
     """Homography mapping scene pixels → normalized paper [0,1]² from the surface.
 
     Built by inverting the robust normalized→scene homography (see
     :func:`_surface_scene_homography`) so the same scene-pixel RANSAC rejects
     wrong-plane / duplicate-id tags. This is the SAME surface plane the AoI editor
-    warps onto, so mapped gaze lands in the AoI coordinate system."""
-    H_ns = _surface_scene_homography(detections, registry)
+    warps onto, so mapped gaze lands in the AoI coordinate system.
+
+    With `folder_path` the input side is UNDISTORTED pixels, so callers must
+    undistort the gaze sample before applying it."""
+    H_ns = _surface_scene_homography(detections, registry, folder_path)
     if H_ns is None:
         return None
     try:
@@ -656,7 +801,12 @@ def _build_registry_from_state(adir: Path, segment_id: str, scene_video: str) ->
 
     Uses the segment's saved ``selected_tags``; for legacy states without them,
     re-detects AprilTags on the stored reference frame. Returns ``{tag_id: [[u,v]×4]}``
-    (normalized paper coords) or None if no surface can be established."""
+    (normalized paper coords) or None if no surface can be established.
+
+    The saved tags always come from a SCENE FRAME (an uploaded reference image only
+    replaces the background picture, never the tag selection), so their lens
+    distortion is always corrected here."""
+    folder_path = str(adir.parent)
     state = _load_segment_state(adir, segment_id)
     raw_tags = state.get("selected_tags")
 
@@ -685,7 +835,7 @@ def _build_registry_from_state(adir: Path, segment_id: str, scene_video: str) ->
     finally:
         cap.release()
 
-    return _build_surface_registry(selected_tags, frame_w, frame_h)
+    return _build_surface_registry(selected_tags, frame_w, frame_h, folder_path)
 
 
 def _build_recording_registry(adir: Path, scene_video: str) -> Optional[dict]:
@@ -734,6 +884,10 @@ async def start_surface_positions(recording_id: str, segment_id: str = "general"
     (adir / "surface.json").write_text(json.dumps({
         "OUTPUT_W": OUTPUT_W, "OUTPUT_H": OUTPUT_H,
         "segment_id": segment_id, "markers": registry,
+        # Marks which geometry the sibling surface_positions.csv was produced with,
+        # so gaze re-projection never reuses corners fitted without distortion
+        # correction (they would silently mix coordinate conventions).
+        "geometry": SURFACE_GEOMETRY,
     }))
 
     _surface_jobs[recording_id] = {

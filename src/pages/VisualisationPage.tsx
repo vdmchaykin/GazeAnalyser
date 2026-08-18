@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { formatDuration, formatDate } from "@/lib/utils";
 import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
 import { GazeSourceBadge } from "@/components/gaze/GazeSourceBadge";
+import { GazeOffsetPanel, type PaperPreview } from "@/components/gaze/GazeOffsetPanel";
 import type { RecordingMeta, RecordingEvent, GazePrediction, Fixation } from "@/types";
 
 // Surface (warped paper) canvas resolution — shared with AoI / Surface Map so
@@ -326,6 +327,8 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
   const [aoiMetric, setAoiMetric] = useState<AoiMetric>("dwell");
   const [radius, setRadius] = useState(40);
   const [saving, setSaving] = useState(false);
+  // Paper coords the offset panel is previewing; null = the stored mapping.
+  const [preview, setPreview] = useState<PaperPreview | null>(null);
 
   // Canvas kept in state (not a ref) so the render effect re-runs once it mounts.
   const [canvas, setCanvas] = useState<HTMLCanvasElement | null>(null);
@@ -408,6 +411,19 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
     setAreas([]); setPaperImg(null);
   };
 
+  // After an offset is applied the mapped gaze and its fixations were rewritten;
+  // the AoI shapes and the segment list are untouched, so only these two reload.
+  const reloadGaze = async () => {
+    if (!recording) return;
+    const [preds, fixs] = await Promise.all([
+      api.get<GazePrediction[]>(`/api/recordings/${recording.id}/gaze/predictions`).catch(() => [] as GazePrediction[]),
+      api.get<Fixation[]>(`/api/recordings/${recording.id}/gaze/fixations`).catch(() => [] as Fixation[]),
+    ]);
+    setPredictions(preds);
+    setFixations(fixs);
+    setPreview(null);
+  };
+
   const handleSegment = async (segId: string) => {
     setActiveSegId(segId);
     if (recording) await loadAoiState(recording.id, segId);
@@ -421,12 +437,19 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
     [predictions, events, activeSeg, duration],
   );
 
+  // While the offset panel previews a correction, the samples keep their
+  // timestamps and only their paper coords change — same order, same length.
+  const shownPreds = useMemo(() => {
+    if (!preview || preview.length !== predictions.length) return predictions;
+    return predictions.map((p, i) => ({ ...p, paper_x: preview[i][0], paper_y: preview[i][1] }));
+  }, [predictions, preview]);
+
   const gazePts = useMemo(() => {
     if (!windowNs) return [];
     const [lo, hi] = windowNs;
-    return predictions.filter(p =>
+    return shownPreds.filter(p =>
       p.paper_x !== null && p.paper_y !== null && p.timestamp_ns >= lo && p.timestamp_ns <= hi);
-  }, [predictions, windowNs]);
+  }, [shownPreds, windowNs]);
 
   const segFix = useMemo(() => {
     const lo = windowNs?.[0] ?? -Infinity;
@@ -605,6 +628,12 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
               ))}
             </div>
           )}
+
+          <GazeOffsetPanel
+            recordingId={recording.id}
+            onPreview={setPreview}
+            onApplied={reloadGaze}
+          />
 
           <button
             onClick={downloadPng}

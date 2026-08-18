@@ -16,6 +16,12 @@ from app.api.routes.aoi import (
     _build_recording_registry,
     _make_apriltag_detector,
     _scene_to_paper_H,
+    _invalidate_aoi_metrics,
+    _SURFACE_COLS,
+    FRAME_HOMOGRAPHY_CACHE,
+    SURFACE_GEOMETRY,
+    scene_intrinsics,
+    undistort_points,
     _APRILTAG_AVAILABLE,
     _BULK_QUAD_DECIMATE,
     _BULK_NTHREADS,
@@ -1092,44 +1098,70 @@ def _make_paper_projector(rec: dict):
     scene_path = rec.get("scene_video")
     if scene_path:
         registry = _build_recording_registry(_aoi_dir(folder_path), scene_path)
-        scene_ts, homographies = _build_homographies(scene_path, registry)
+        scene_ts, homographies = _build_homographies(scene_path, registry, folder_path)
+        # Keep the per-frame geometry: re-projecting the gaze (offset correction)
+        # then costs milliseconds instead of another AprilTag pass over the video.
+        _save_frame_homographies(_aoi_dir(folder_path), scene_ts, homographies)
     else:
         scene_ts, homographies = np.array([], dtype=np.int64), {}
     have_scene_ts = scene_ts.size > 0
 
     def project(ts_ns: int, x: float, y: float, frame_i: Optional[int] = None):
-        # Match the scene frame by NEAREST TIMESTAMP (not positional index): the
-        # gaze grid and the scene video are separate streams with a ~4-frame start
-        # offset. Fall back to index only if the scene .time file is missing.
         if have_scene_ts:
-            j = int(np.searchsorted(scene_ts, ts_ns))
-            if j >= scene_ts.size:
-                j = scene_ts.size - 1
-            elif j > 0 and abs(int(scene_ts[j - 1]) - ts_ns) <= abs(int(scene_ts[j]) - ts_ns):
-                j -= 1
-            H = homographies.get(j)
-        else:
-            H = homographies.get(frame_i)
-        if H is None:
-            return None, None
-        mapped = cv2.perspectiveTransform(np.array([[[x, y]]], dtype=np.float32), H)
-        px_p, py_p = float(mapped[0][0][0]), float(mapped[0][0][1])
-        if 0 <= px_p <= 1 and 0 <= py_p <= 1:
-            return px_p, py_p
-        return None, None
+            return _project_sample(scene_ts, homographies, ts_ns, x, y, folder_path)
+        return _project_with_H(homographies.get(frame_i), x, y, folder_path)
 
     return project
 
 
-def _write_predictions(dirs: list, recording_id: str, samples: list, project) -> tuple:
+def _project_with_H(H, x: float, y: float, folder_path: Optional[str] = None) -> tuple:
+    """Map one raw scene-pixel gaze point through a scene→paper homography.
+
+    The homography lives in ideal pinhole coordinates (the tag corners it was
+    fitted to were undistorted), so the gaze is undistorted the same way first."""
+    if H is None:
+        return None, None
+    p = undistort_points(folder_path, [(x, y)])[0]
+    mapped = cv2.perspectiveTransform(np.array([[[float(p[0]), float(p[1])]]], dtype=np.float32), H)
+    px_p, py_p = float(mapped[0][0][0]), float(mapped[0][0][1])
+    if 0 <= px_p <= 1 and 0 <= py_p <= 1:
+        return px_p, py_p
+    return None, None
+
+
+def _nearest_frame(scene_ts: np.ndarray, ts_ns: int) -> int:
+    """Index of the scene frame closest in time to a gaze sample.
+
+    Matched by NEAREST TIMESTAMP (not positional index): the gaze grid and the
+    scene video are separate streams with a ~4-frame start offset."""
+    j = int(np.searchsorted(scene_ts, ts_ns))
+    if j >= scene_ts.size:
+        return scene_ts.size - 1
+    if j > 0 and abs(int(scene_ts[j - 1]) - ts_ns) <= abs(int(scene_ts[j]) - ts_ns):
+        return j - 1
+    return j
+
+
+def _project_sample(scene_ts: np.ndarray, homographies: dict, ts_ns: int, x: float, y: float,
+                    folder_path: Optional[str] = None) -> tuple:
+    return _project_with_H(homographies.get(_nearest_frame(scene_ts, ts_ns)), x, y, folder_path)
+
+
+def _write_predictions(dirs: list, recording_id: str, samples: list, project,
+                       offset: tuple = (0.0, 0.0)) -> tuple:
     """Project ``(timestamp_ns, scene_x, scene_y)`` samples and write the CSV.
 
     Written to every directory in `dirs` — the cloud sources share one projection.
+    `offset` is the recording's gaze offset correction (scene px), added before the
+    surface projection; the CSV stores the CORRECTED scene gaze, so everything
+    downstream (fixations, player overlay, export) sees one consistent position.
     Returns ``(n_samples, n_on_paper)``."""
     import csv
     rows = []
     on_paper = 0
-    for i, (ts_ns, x, y) in enumerate(samples):
+    odx, ody = offset
+    for i, (ts_ns, x0, y0) in enumerate(samples):
+        x, y = x0 + odx, y0 + ody
         paper_x, paper_y = project(ts_ns, x, y, i)
         if paper_x is not None:
             on_paper += 1
@@ -1215,7 +1247,9 @@ async def _map_cloud_gaze(rec: dict, recording_id: str, resample: bool) -> dict:
 
     project = _make_paper_projector(rec)
     dirs = [_gaze_dir(folder_path, s) for s in CLOUD_SOURCES]
-    total, on_paper = _write_predictions(dirs, recording_id, samples, project)
+    # a re-map keeps the offset correction the user already dialled in
+    total, on_paper = _write_predictions(dirs, recording_id, samples, project,
+                                         offset=read_offset(dirs[0]))
     await _mark_gaze_result(recording_id)
 
     result = {
@@ -1404,7 +1438,8 @@ async def map_gaze(recording_id: str, source: Optional[str] = None, resample_30f
         pupils["pred_gaze_y"].tolist(),
     ))
     frames_with_gaze, frames_on_paper = _write_predictions(
-        [gdir], recording_id, samples, _make_paper_projector(rec)
+        [gdir], recording_id, samples, _make_paper_projector(rec),
+        offset=read_offset(gdir),   # keep the user's offset correction across re-maps
     )
     await _mark_gaze_result(recording_id)
 
@@ -1421,6 +1456,333 @@ async def map_gaze(recording_id: str, source: Optional[str] = None, resample_30f
     }
     (gdir / "mapping_result.json").write_text(json.dumps(result, indent=2))
     return result
+
+
+# ── gaze offset correction ─────────────────────────────────────────────────
+# Neon reports gaze as a ray from the eye projected into the scene camera at a far
+# reference depth. With the page ~50 cm away, the ~2 cm eye-to-camera baseline puts
+# the reported point ~2° above the real target (parallax); a per-wearer calibration
+# bias adds to it. Both are constant within a recording, so ONE (dx, dy) in scene
+# pixels applied before the surface projection removes them.
+#
+# The stored value is the offset ALREADY baked into that source's
+# gaze_predictions.csv, so setting a new one only has to apply the difference —
+# the correction never accumulates across edits.
+
+_OFFSET_FILE = "gaze_offset.json"
+
+
+def read_offset(gdir: Path) -> tuple:
+    f = gdir / _OFFSET_FILE
+    if f.exists():
+        try:
+            d = json.loads(f.read_text())
+            return float(d.get("dx", 0.0)), float(d.get("dy", 0.0))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
+    return 0.0, 0.0
+
+
+def write_offset(gdir: Path, dx: float, dy: float) -> None:
+    gdir.mkdir(parents=True, exist_ok=True)
+    (gdir / _OFFSET_FILE).write_text(json.dumps({"dx": dx, "dy": dy}))
+
+
+def _scene_px_per_deg(folder_path: str) -> float:
+    """Scene-camera pixels per degree, from the device's own lens calibration.
+
+    The scene camera matrix gives the focal length in pixels, and 1° near the
+    optical axis is f·tan(1°). Falls back to the measured constant when the
+    recording ships no calibration."""
+    kd = scene_intrinsics(folder_path)
+    if kd is None:
+        return _SCENE_PX_PER_DEG
+    f = float((kd[0][0, 0] + kd[0][1, 1]) / 2)
+    return f * float(np.tan(np.deg2rad(1.0)))
+
+
+# Bumped when the meaning of a cached homography changes, so a stale cache from an
+# older build is ignored instead of silently mixing coordinate conventions.
+_HOMOGRAPHY_CONVENTION = "undistorted-scene-to-paper/1"
+
+
+def _save_frame_homographies(adir: Path, scene_ts: np.ndarray, homographies: dict) -> None:
+    if not homographies:
+        return
+    idx = np.array(sorted(homographies), dtype=np.int64)
+    try:
+        np.savez_compressed(
+            adir / FRAME_HOMOGRAPHY_CACHE,
+            frames=idx,
+            H=np.stack([np.asarray(homographies[int(i)], dtype=np.float64) for i in idx]),
+            scene_ts=np.asarray(scene_ts, dtype=np.int64),
+            convention=np.array(_HOMOGRAPHY_CONVENTION),
+        )
+    except OSError:
+        pass  # a missing cache only costs a re-scan later
+
+
+def _homographies_from_cache(adir: Path):
+    p = adir / FRAME_HOMOGRAPHY_CACHE
+    if not p.exists():
+        return None
+    try:
+        d = np.load(p)
+        if str(d.get("convention", "")) != _HOMOGRAPHY_CONVENTION:
+            return None
+        return d["scene_ts"], {int(i): h for i, h in zip(d["frames"], d["H"])}
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _homographies_from_surface_csv(adir: Path, folder_path: Optional[str] = None):
+    """Rebuild per-frame scene→paper homographies from surface_positions.csv.
+
+    That export already stores the surface's 4 corners for every frame, which is
+    the same geometry the mapping fitted — enough to re-project gaze without
+    touching the video. Those corners are raw sensor pixels (they are drawn over
+    the video), so they are undistorted here to match the mapping's convention."""
+    import csv as csv_mod
+    path = adir / "surface_positions.csv"
+    if not path.exists():
+        return None
+    # Only trust corners produced with the current geometry (see SURFACE_GEOMETRY);
+    # older exports were fitted without distortion correction.
+    marker = adir / "surface.json"
+    try:
+        if json.loads(marker.read_text()).get("geometry") != SURFACE_GEOMETRY:
+            return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    unit = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
+    corner_cols = _SURFACE_COLS[3:]
+    ts_list, homographies = [], {}
+    with open(path) as f:
+        for i, row in enumerate(csv_mod.DictReader(f)):
+            ts_list.append(int(row["timestamp [ns]"]) if row["timestamp [ns]"] else 0)
+            if not row[corner_cols[0]]:
+                continue
+            pts = np.array([float(row[c]) for c in corner_cols], dtype=np.float32).reshape(4, 2)
+            pts = undistort_points(folder_path, pts).astype(np.float32)
+            H, _ = cv2.findHomography(unit, pts, method=0)   # paper norm -> undistorted px
+            if H is None:
+                continue
+            try:
+                homographies[i] = np.linalg.inv(H)
+            except np.linalg.LinAlgError:
+                continue
+    if not homographies:
+        return None
+    return np.array(ts_list, dtype=np.int64), homographies
+
+
+def _has_cached_geometry(adir: Path) -> bool:
+    """Can a re-projection reuse stored geometry instead of re-scanning the video?
+
+    Only counts artefacts written with the CURRENT geometry — an older cache is
+    ignored everywhere, so promising a fast preview from one would be a lie."""
+    cache = adir / FRAME_HOMOGRAPHY_CACHE
+    if cache.exists():
+        try:
+            if str(np.load(cache).get("convention", "")) == _HOMOGRAPHY_CONVENTION:
+                return True
+        except (OSError, ValueError):
+            pass
+    if not (adir / "surface_positions.csv").exists():
+        return False
+    try:
+        return json.loads((adir / "surface.json").read_text()).get("geometry") == SURFACE_GEOMETRY
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _frame_homographies(rec: dict):
+    """``(scene_ts, {frame: H_scene→paper})`` — cache, then surface_positions.csv,
+    then (last resort) a fresh AprilTag pass over the video, which is cached."""
+    folder_path = rec["folder_path"]
+    adir = _aoi_dir(folder_path)
+    for got in (_homographies_from_cache(adir), _homographies_from_surface_csv(adir, folder_path)):
+        if got and got[1] is not None and len(got[1]) > 0:
+            return got
+    scene_path = rec.get("scene_video")
+    if not scene_path:
+        return np.array([], dtype=np.int64), {}
+    registry = _build_recording_registry(adir, scene_path)
+    scene_ts, homographies = _build_homographies(scene_path, registry, folder_path)
+    _save_frame_homographies(adir, scene_ts, homographies)
+    return scene_ts, homographies
+
+
+def _offset_dirs(folder_path: str, src: str) -> list:
+    """Directories holding the projection this source owns — the two cloud sources
+    share one, exactly as gaze mapping writes it."""
+    sources = CLOUD_SOURCES if src in CLOUD_SOURCES else (src,)
+    return [_gaze_dir(folder_path, s) for s in sources]
+
+
+def _reproject_predictions(rec: dict, gdir: Path, ddx: float, ddy: float) -> tuple:
+    """Shift the stored scene gaze by (ddx, ddy) and re-project it onto the paper.
+
+    Returns ``(rows, n_on_paper)`` with the updated rows; the caller decides
+    whether to write them (apply) or only report them (preview)."""
+    import csv as csv_mod
+    pred_csv = gdir / "gaze_predictions.csv"
+    if not pred_csv.exists():
+        raise HTTPException(status_code=400, detail="Run gaze mapping first")
+
+    scene_ts, homographies = _frame_homographies(rec)
+    if not homographies:
+        raise HTTPException(
+            status_code=400,
+            detail="No surface geometry available — define the AoI surface and run gaze mapping first.",
+        )
+    have_ts = scene_ts.size > 0
+
+    with open(pred_csv) as f:
+        rows = list(csv_mod.DictReader(f))
+
+    on_paper = 0
+    for i, row in enumerate(rows):
+        x = float(row["pred_gaze_x"]) + ddx
+        y = float(row["pred_gaze_y"]) + ddy
+        ts_ns = int(row["timestamp_ns"])
+        folder_path = rec["folder_path"]
+        if have_ts:
+            paper_x, paper_y = _project_sample(scene_ts, homographies, ts_ns, x, y, folder_path)
+        else:
+            paper_x, paper_y = _project_with_H(homographies.get(i), x, y, folder_path)
+        row["pred_gaze_x"] = round(x, 2)
+        row["pred_gaze_y"] = round(y, 2)
+        row["paper_x"] = round(paper_x, 4) if paper_x is not None else None
+        row["paper_y"] = round(paper_y, 4) if paper_y is not None else None
+        if paper_x is not None:
+            on_paper += 1
+    return rows, on_paper
+
+
+def _write_prediction_rows(gdirs: list, rows: list) -> None:
+    import csv as csv_mod
+    for d in gdirs:
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "gaze_predictions.csv", "w", newline="") as f:
+            w = csv_mod.DictWriter(f, fieldnames=_PREDICTION_COLS)
+            w.writeheader()
+            w.writerows(rows)
+
+
+def _refresh_fixations(rec: dict, recording_id: str, src: str) -> list:
+    """Re-run fixation detection for every source whose gaze just moved.
+
+    A constant offset cannot change the I-DT segmentation (dispersion is
+    translation-invariant), but the centroids and the surface coordinates shift,
+    so the fixation files have to be rebuilt to stay consistent with the gaze."""
+    redone = []
+    for s in (CLOUD_SOURCES if src in CLOUD_SOURCES else (src,)):
+        gdir = _gaze_dir(rec["folder_path"], s)
+        if not (gdir / "fixations.csv").exists():
+            continue
+        if s == "cloud_native":
+            _import_cloud_fixations(rec, recording_id)
+            redone.append(s)
+            continue
+        # reuse the thresholds the user last detected with
+        params = {}
+        rf = gdir / "fixations_result.json"
+        if rf.exists():
+            try:
+                params = json.loads(rf.read_text())
+            except (json.JSONDecodeError, OSError):
+                params = {}
+        req = FixationRequest(
+            max_dispersion_deg=params.get("max_dispersion_deg", 1.5),
+            min_duration_ms=params.get("min_duration_ms", 80.0),
+            max_gap_ms=params.get("max_gap_ms", 100.0),
+        )
+        samples = _read_prediction_samples(gdir / "gaze_predictions.csv")
+        if len(samples) < 2:
+            continue
+        fixations = _detect_fixations_idt(
+            samples, req.max_dispersion_deg * _SCENE_PX_PER_DEG,
+            int(req.min_duration_ms * 1e6), int(req.max_gap_ms * 1e6),
+        )
+        _write_fixations(gdir, recording_id, fixations)
+        result = {
+            **_fixation_stats(fixations, samples[-1][0] - samples[0][0]),
+            "max_dispersion_deg": req.max_dispersion_deg,
+            "min_duration_ms": req.min_duration_ms,
+            "max_gap_ms": req.max_gap_ms,
+        }
+        (gdir / "fixations_result.json").write_text(json.dumps(result, indent=2))
+        redone.append(s)
+    return redone
+
+
+class OffsetRequest(BaseModel):
+    dx: float = 0.0
+    dy: float = 0.0
+    preview: bool = False
+
+
+@router.get("/offset")
+async def get_gaze_offset(recording_id: str, source: Optional[str] = None):
+    """The offset currently baked into this source's mapped gaze."""
+    rec = await _get_recording(recording_id)
+    src = active_source(rec["folder_path"], source)
+    gdir = _gaze_dir(rec["folder_path"], src)
+    dx, dy = read_offset(gdir)
+    px_per_deg = _scene_px_per_deg(rec["folder_path"])
+    adir = _aoi_dir(rec["folder_path"])
+    return {
+        "source": src,
+        "dx": dx, "dy": dy,
+        "deg_x": round(dx / px_per_deg, 2),
+        "deg_y": round(dy / px_per_deg, 2),
+        "px_per_deg": round(px_per_deg, 2),
+        "has_mapping": (gdir / "gaze_predictions.csv").exists(),
+        "fast_reproject": _has_cached_geometry(adir),
+    }
+
+
+@router.post("/offset")
+async def set_gaze_offset(recording_id: str, req: OffsetRequest, source: Optional[str] = None):
+    """Preview or apply a gaze offset correction (scene pixels).
+
+    ``preview=true`` returns the re-projected paper coordinates without touching
+    any file, so a slider can show the result live. Applying writes the corrected
+    gaze to every directory of the source, rebuilds its fixations and drops the AoI
+    metrics, which no longer match."""
+    rec = await _get_recording(recording_id)
+    src = active_source(rec["folder_path"], source)
+    gdirs = _offset_dirs(rec["folder_path"], src)
+    old_dx, old_dy = read_offset(gdirs[0])
+
+    rows, on_paper = _reproject_predictions(rec, gdirs[0], req.dx - old_dx, req.dy - old_dy)
+
+    if req.preview:
+        return {
+            "preview": True,
+            "n_samples": len(rows),
+            "n_on_paper": on_paper,
+            "paper": [[r["paper_x"], r["paper_y"]] for r in rows],
+        }
+
+    _write_prediction_rows(gdirs, rows)
+    for d in gdirs:
+        write_offset(d, req.dx, req.dy)
+    refixated = _refresh_fixations(rec, recording_id, src)
+    _invalidate_aoi_metrics(_aoi_dir(rec["folder_path"]))
+
+    px_per_deg = _scene_px_per_deg(rec["folder_path"])
+    return {
+        "preview": False,
+        "source": src,
+        "dx": req.dx, "dy": req.dy,
+        "deg_x": round(req.dx / px_per_deg, 2),
+        "deg_y": round(req.dy / px_per_deg, 2),
+        "n_samples": len(rows),
+        "n_on_paper": on_paper,
+        "refixated": refixated,
+    }
 
 
 @router.get("/map/result")
@@ -1787,7 +2149,8 @@ def _load_scene_timestamps(scene_path: str) -> np.ndarray:
     return np.array([], dtype=np.int64)
 
 
-def _build_homographies(scene_path: str, registry: Optional[dict]) -> tuple[np.ndarray, dict[int, np.ndarray]]:
+def _build_homographies(scene_path: str, registry: Optional[dict],
+                        folder_path: Optional[str] = None) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     """Per-scene-frame scene→paper homographies from the AoI surface registry.
 
     Returns ``(scene_ts, homographies)`` where ``scene_ts[i]`` is the device
@@ -1813,7 +2176,7 @@ def _build_homographies(scene_path: str, registry: Optional[dict]) -> tuple[np.n
         if not ok:
             break
         dets = detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        H = _scene_to_paper_H(dets, registry)
+        H = _scene_to_paper_H(dets, registry, folder_path)
         if H is not None:
             homographies[frame_idx] = H
         frame_idx += 1
