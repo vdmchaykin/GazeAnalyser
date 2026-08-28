@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CheckCircle2, Pause, Play, Trash2, Undo2 } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
+import { SceneAnchorPanel, type AnchorStats } from "@/components/anchor/SceneAnchorPanel";
+import { useSceneAnchor, type AnchorMode } from "@/lib/useSceneAnchor";
+import { tourAnchor } from "@/lib/tour/anchors";
 import type { CalibrationPoint, GazeAnalysisState, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
@@ -32,6 +35,15 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
   const [speed, setSpeed] = useState(1);
   const [eyePos, setEyePos] = useState({ x: null as number | null, y: null as number | null });
   const [dragging, setDragging] = useState(false);
+
+  // A calibration point is a scene-pixel position that is only true in the frame
+  // it was clicked in. Drawn unchanged it sticks to the SCREEN, drifting off the
+  // paper as soon as the head-mounted camera moves — so each dot is transported
+  // into the frame currently on screen, exactly as the player's scanpath does.
+  const [anchorScene, setAnchorScene] = useState(true);
+  const anchorStatsRef = useRef<AnchorStats>({ surface: 0, flow: 0, fixed: 0 });
+  const { frameAt, makeTransport, inputsVersion, surfaceLocalized, motionSolved, loadMotion } =
+    useSceneAnchor(recording.id);
 
   // Get duration + naturalSize from scene video metadata
   useEffect(() => {
@@ -76,25 +88,64 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
     const scaleX = canvas.width / naturalSize.w;
     const scaleY = canvas.height / naturalSize.h;
 
+    // One transport per rendered frame, shared by all nine dots. Without
+    // anchoring (or without the files it needs) every dot reports "fixed" and
+    // stays at the pixel it was clicked at.
+    const t = sceneRef.current?.currentTime ?? 0;
+    const curIdx = anchorScene ? frameAt(t, duration) : -1;
+    const transport = anchorScene ? makeTransport(curIdx) : null;
+    const stats: AnchorStats = { surface: 0, flow: 0, fixed: 0 };
+
+    ctx.font = "bold 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
     points.forEach((p) => {
-      const cx = p.gaze_x * scaleX;
-      const cy = p.gaze_y * scaleY;
+      let x = p.gaze_x;
+      let y = p.gaze_y;
+      let mode: AnchorMode = "fixed";
+      if (transport) {
+        [x, y, mode] = transport(p.gaze_x, p.gaze_y, frameAt(p.timestamp_ns / 1e9, duration));
+      }
+      stats[mode]++;
+
+      const cx = x * scaleX;
+      const cy = y * scaleY;
+      // An unanchored dot is drawn hollow and dashed: it is still at its clicked
+      // screen position, which is only where it belongs in its own frame.
+      const anchored = mode !== "fixed";
       ctx.beginPath();
       ctx.arc(cx, cy, 8, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(34, 197, 94, 0.4)";
+      ctx.fillStyle = anchored ? "rgba(34, 197, 94, 0.4)" : "rgba(34, 197, 94, 0.12)";
       ctx.fill();
-      ctx.strokeStyle = "#22c55e";
+      ctx.setLineDash(anchored ? [] : [3, 3]);
+      ctx.strokeStyle = anchored ? "#22c55e" : "rgba(34, 197, 94, 0.5)";
       ctx.lineWidth = 2;
       ctx.stroke();
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 11px sans-serif";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
+      ctx.setLineDash([]);
+      ctx.fillStyle = anchored ? "#fff" : "rgba(255, 255, 255, 0.5)";
       ctx.fillText(String(p.point_id), cx, cy);
     });
-  }, [points, naturalSize]);
 
-  useEffect(() => { drawCanvas(); }, [drawCanvas]);
+    anchorStatsRef.current = stats;
+    // `inputsVersion` is not read here — it is in the dependency list so the
+    // dots are redrawn once the anchoring files finish loading.
+  }, [points, naturalSize, anchorScene, duration, frameAt, makeTransport, inputsVersion]);
+
+  // Redraw on any input change, and on every animation frame while the video is
+  // running — the dots follow the camera, so they have to keep up with it.
+  useEffect(() => { drawCanvas(); }, [drawCanvas, seekTime]);
+
+  useEffect(() => {
+    if (!playing) return;
+    let raf = 0;
+    const tick = () => {
+      drawCanvas();
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [playing, drawCanvas]);
 
   const handleScrub = (t: number) => {
     if (sceneRef.current) sceneRef.current.currentTime = t;
@@ -173,9 +224,13 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
     const gaze_x = Math.round((cx / canvas.clientWidth) * naturalSize.w);
     const gaze_y = Math.round((cy / canvas.clientHeight) * naturalSize.h);
 
+    // The frame on screen, not the last `timeupdate` — that event only fires a
+    // few times a second, and the point is anchored from the frame it names.
+    const clickTime = sceneRef.current?.currentTime ?? seekTime;
+
     const newPoint: CalibrationPoint = {
       point_id: currentPointId,
-      timestamp_ns: Math.round(seekTime * 1e9),
+      timestamp_ns: Math.round(clickTime * 1e9),
       gaze_x,
       gaze_y,
     };
@@ -238,7 +293,8 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
   return (
     <div className="flex h-full">
       {/* Left panel — point list */}
-      <div className="w-56 shrink-0 border-r border-zinc-800 flex flex-col">
+      <div className="w-56 shrink-0 border-r border-zinc-800 flex flex-col"
+           {...tourAnchor("gaze.calibPoints")}>
         <div className="px-4 py-3 border-b border-zinc-800">
           <p className="text-xs font-medium text-white uppercase tracking-wider">Calibration Points</p>
         </div>
@@ -296,6 +352,22 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
             </button>
           )}
         </div>
+
+        {/* Anchoring controls + the scene-motion job the fallback path needs */}
+        <SceneAnchorPanel
+          recordingId={recording.id}
+          anchor={anchorScene}
+          onAnchorChange={setAnchorScene}
+          surfaceLocalized={surfaceLocalized}
+          motionSolved={motionSolved}
+          statsRef={anchorStatsRef}
+          onMotionReady={loadMotion}
+          title="Point anchoring"
+          label="Keep points on the paper"
+          hintOn="Marked points follow the scene as the camera moves."
+          hintOff="Marked points stay at their original screen position."
+          className="border-t border-zinc-800 px-3 py-2.5"
+        />
       </div>
 
       {/* Right panel — video + canvas overlay + controls */}
@@ -326,6 +398,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
               preload="metadata"
             />
             <canvas
+              {...tourAnchor("gaze.calibCanvas")}
               ref={canvasRef}
               width={960}
               height={540}
@@ -380,7 +453,8 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
         </div>
 
         {/* Controls */}
-        <div className="border-t border-zinc-800 bg-zinc-900 px-4 py-3 space-y-2">
+        <div className="border-t border-zinc-800 bg-zinc-900 px-4 py-3 space-y-2"
+             {...tourAnchor("gaze.calibControls")}>
           <div className="flex items-center gap-3">
             <button
               onClick={togglePlay}
@@ -421,6 +495,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
                 {points.length} / {TOTAL_POINTS} points marked
               </span>
               <button
+                {...tourAnchor("gaze.calibSave")}
                 onClick={handleSave}
                 disabled={points.length === 0 || saving}
                 className="flex items-center gap-2 px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500

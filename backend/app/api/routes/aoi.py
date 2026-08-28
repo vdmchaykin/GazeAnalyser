@@ -3,6 +3,7 @@ import csv
 import json
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -300,7 +301,8 @@ def _detect_and_warp(frame: np.ndarray, timestamp_s: float,
     way — the frontend draws them on the frame it was given.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    detections = _make_apriltag_detector().detect(gray)
+    with TagDetector() as detector:
+        detections = detector.detect(gray)
 
     annotated = frame.copy()
     tag_infos = []
@@ -522,17 +524,42 @@ def _surface_corners_from_tags(
     return np.array(src_pts, dtype=np.float32)
 
 
+def _warp_from_raw(frame: np.ndarray, H: np.ndarray, folder_path: str) -> np.ndarray:
+    """Sample the page view straight out of the RAW frame, in one resampling.
+
+    `cv2.undistort` keeps the original camera matrix, so on a lens as wide as the
+    scene camera's it pushes the periphery off the canvas: a page lying close to
+    the wearer reaches the bottom frame edge, its undistorted corners land BELOW
+    row `h`, and those rows come back black — the page's bottom strip, tags
+    included, is thrown away before the warp ever runs.
+
+    The pixels are all still in the raw frame, so go there directly: for every
+    destination pixel, `H⁻¹` gives the ideal-pinhole scene point and
+    :func:`distort_points` turns that into the raw sensor pixel to sample. `H` is
+    unchanged — the page geometry is still defined by undistorted tag corners —
+    only the sampling avoids the intermediate crop."""
+    Hi = np.linalg.inv(H)
+    yy, xx = np.mgrid[0:OUTPUT_H, 0:OUTPUT_W].astype(np.float32)
+    hom = np.stack([xx.ravel(), yy.ravel(), np.ones(xx.size, dtype=np.float32)])
+    ideal = Hi @ hom
+    ideal = (ideal[:2] / ideal[2]).T
+    raw = distort_points(folder_path, ideal).astype(np.float32)
+    return cv2.remap(
+        frame, raw[:, 0].reshape(OUTPUT_H, OUTPUT_W), raw[:, 1].reshape(OUTPUT_H, OUTPUT_W),
+        cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+    )
+
+
 def _warp_frame(frame: np.ndarray, tags: List[TagInfo],
                 folder_path: Optional[str] = None) -> Optional[str]:
     """Compute perspective warp from a list of tag infos; returns base64 JPEG or None.
 
-    For a scene-video frame (`folder_path` given) the lens distortion is removed
-    first — from the image and from the tag corners — so this background lives in
-    the same undistorted page geometry the gaze is mapped into."""
+    For a scene-video frame (`folder_path` given) the tag corners are undistorted
+    first, so this background lives in the same undistorted page geometry the gaze
+    is mapped into; the pixels are then sampled from the raw frame (see
+    :func:`_warp_from_raw`)."""
     kd = scene_intrinsics(folder_path)
     if kd is not None:
-        K, D = kd
-        frame = cv2.undistort(frame, K, D)
         tags = _undistort_tags(folder_path, tags)
 
     src_pts = _surface_corners_from_tags(tags, frame.shape[1], frame.shape[0])
@@ -543,7 +570,8 @@ def _warp_frame(frame: np.ndarray, tags: List[TagInfo],
     H, _ = cv2.findHomography(src_pts, dst_pts, method=0)
     if H is None:
         return None
-    warped = cv2.warpPerspective(frame, H, (OUTPUT_W, OUTPUT_H))
+    warped = (_warp_from_raw(frame, H, folder_path) if kd is not None
+              else cv2.warpPerspective(frame, H, (OUTPUT_W, OUTPUT_H)))
     _, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return base64.b64encode(buf).decode()
 
@@ -702,19 +730,37 @@ def _run_surface_positions(
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         job["total"] = total
 
-        detector = _make_apriltag_detector(_BULK_QUAD_DECIMATE, _BULK_NTHREADS)
+        detector = TagDetector(_BULK_QUAD_DECIMATE, _BULK_NTHREADS)
 
         localized = 0
-        with open(out_csv, "w", newline="") as f:
+        dropped = 0
+        misses = 0
+        part = out_csv.with_suffix(".part")
+        with open(part, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(_SURFACE_COLS)
             idx = 0
             while True:
                 if job.get("cancelled"):
                     break
+                if total and idx >= total:
+                    break
                 ok, frame = cap.read()
                 if not ok:
-                    break
+                    # An undecodable frame, not the end of the file (see
+                    # MAX_CONSECUTIVE_READ_FAILURES). Record it as unlocalized so
+                    # row index keeps meaning scene frame index — every consumer
+                    # addresses this file by frame — and read on.
+                    misses += 1
+                    if misses > MAX_CONSECUTIVE_READ_FAILURES:
+                        break
+                    dropped += 1
+                    ts = int(timestamps[idx]) if idx < len(timestamps) else ""
+                    writer.writerow([section_id, ts, "", *[""] * 8])
+                    idx += 1
+                    job["progress"] = idx
+                    continue
+                misses = 0
                 ts = int(timestamps[idx]) if idx < len(timestamps) else ""
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 dets = detector.detect(gray)
@@ -729,13 +775,25 @@ def _run_surface_positions(
                 idx += 1
                 job["progress"] = idx
         cap.release()
+        detector.close()
 
         _ = (frame_w, frame_h)  # available for future validation/debug
+        job["dropped"] = dropped
         if job.get("cancelled"):
-            out_csv.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
             job["status"] = "idle"
+        elif total and idx < total:
+            # Never publish a short file as a finished one: it would come back
+            # from the status endpoint as "done" and every frame past the cut
+            # would silently have no surface.
+            part.unlink(missing_ok=True)
+            job["status"] = "error"
+            job["message"] = (f"Scene video could not be decoded past frame {idx} of {total} — "
+                              f"the file may be damaged")
         else:
+            part.replace(out_csv)
             job["localized"] = localized
+            job["message"] = f"{dropped} undecodable frame(s) skipped" if dropped else ""
             job["status"] = "done"
     except Exception as e:  # pragma: no cover - surfaced via status endpoint
         job["status"] = "error"
@@ -752,6 +810,41 @@ def _load_segment_state(adir: Path, segment_id: str) -> dict:
         if legacy.exists():
             return json.loads(legacy.read_text())
     return {}
+
+
+class TagDetector:
+    """A pupil-apriltags detector pinned to a worker thread of its own.
+
+    Detecting on the process's MAIN thread segfaults this build of
+    pupil-apriltags. Measured on this machine: 12 of 12 runs died with SIGSEGV
+    (exit 139) across every nthreads / quad_decimate combination tried, while the
+    identical work on a plain worker thread ran clean 12 of 12. It takes the whole
+    server down with it, and FastAPI runs ``async def`` handlers on the event loop
+    — the main thread — so one interactive "Detect AprilTags" click could kill a
+    session mid-analysis.
+
+    Each instance owns its thread rather than sharing one pool, so an interactive
+    request gets its own (creating a thread costs far less than one detection)
+    instead of queueing behind a full-video pass. The detector is built on that
+    same thread it is used from, since only that combination is known to be safe.
+    """
+
+    def __init__(self, quad_decimate: float = 1.0, nthreads: int = 2):
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="apriltag")
+        self._detector = self._pool.submit(_make_apriltag_detector, quad_decimate, nthreads).result()
+
+    def detect(self, gray: np.ndarray):
+        return self._pool.submit(self._detector.detect, gray).result()
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=False)
+
+    def __enter__(self) -> "TagDetector":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.close()
+        return False
 
 
 def _make_apriltag_detector(quad_decimate: float = 1.0, nthreads: int = 2):
@@ -774,6 +867,14 @@ def _make_apriltag_detector(quad_decimate: float = 1.0, nthreads: int = 2):
 # surface_positions) — the reference detection stays at the precise default.
 _BULK_QUAD_DECIMATE = 2.0
 _BULK_NTHREADS = 4
+
+# A single corrupt access unit in the H.264 stream makes OpenCV's read() return
+# False, and the decoder picks straight back up on the very next call — ffmpeg
+# skips exactly that one frame and decodes the rest of the file. Treating the
+# first failure as end-of-file silently truncates a whole-video pass (one 9961-
+# frame recording stopped at 702 and still reported "done"), so a pass tolerates
+# isolated failures and only gives up once this many land in a row.
+MAX_CONSECUTIVE_READ_FAILURES = 30
 
 
 def _scene_to_paper_H(detections, registry: dict,
@@ -824,7 +925,8 @@ def _build_registry_from_state(adir: Path, segment_id: str, scene_video: str) ->
             ok, frame = cap.read()
             if not ok:
                 return None
-            dets = _make_apriltag_detector().detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            with TagDetector() as detector:
+                dets = detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
             selected_tags = [
                 TagInfo(tag_id=int(d.tag_id), center=[float(d.center[0]), float(d.center[1])],
                         corners=d.corners.tolist())

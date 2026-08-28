@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Play, RefreshCw, CheckCircle2, Trash2 } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
+import { tourAnchor } from "@/lib/tour/anchors";
 import type { FixationResult, GazeAnalysisState, GazeSource, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
@@ -130,7 +131,8 @@ export function GazeFixationStep({ recording, source, mappingDone, done: initial
 
       {/* Parameters */}
       {!imports && (
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-5">
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-5"
+           {...tourAnchor("gaze.fixParams")}>
         <p className="text-xs text-zinc-500 uppercase tracking-wider">Parameters</p>
         <ParamSlider
           label="Max dispersion"
@@ -168,7 +170,8 @@ export function GazeFixationStep({ recording, source, mappingDone, done: initial
 
       {/* Results */}
       {done && result && (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4"
+             {...tourAnchor("gaze.fixResults")}>
           <div className="flex items-center gap-2 text-emerald-400">
             <CheckCircle2 className="w-5 h-5" />
             <span className="text-sm font-medium">
@@ -206,6 +209,7 @@ export function GazeFixationStep({ recording, source, mappingDone, done: initial
       {/* Actions */}
       <div className="flex gap-3">
         <button
+          {...tourAnchor("gaze.fixRun")}
           onClick={handleRun}
           disabled={running || !mappingDone}
           className="flex items-center gap-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500

@@ -14,7 +14,7 @@ from app.api.routes.aoi import (
     _aoi_dir,
     _gaze_dir,
     _build_recording_registry,
-    _make_apriltag_detector,
+    TagDetector,
     _scene_to_paper_H,
     _invalidate_aoi_metrics,
     _SURFACE_COLS,
@@ -437,35 +437,74 @@ def _build_clean_30fps(pupils_df, folder_path: str):
 
 
 # ── calibration-point feature aggregation ───────────────────────────────────
-_CALIB_DWELL_MS = 500          # half-window (ms) around a calibration point to aggregate
-_CALIB_MIN_DWELL = 3           # fewer valid frames in the window than this -> use nearest frame
-_CALIB_CONF_KEEP_FRAC = 0.5    # keep the top-confidence fraction of the fixation window
+_CALIB_DWELL_MS = 1000         # furthest (ms) the plateau may reach from the mark
+_CALIB_GUARD_MS = 50           # keep-out margin from the midpoint to the next mark
+_CALIB_PLATEAU_R = 6.0         # px in the eye image: plateau radius around its centre
+_CALIB_SEED_FRAMES = 3         # half-width of the seed median taken at the mark
 _CALIB_MAX_DEGREE = 2          # polynomial degree ceiling for the pupil->gaze map
 
 
-def _aggregate_dwell(valid_df, ts_center: int, feat_cols: list, half_win_ns: int,
-                     conf_col: str = None, keep_frac: float = _CALIB_CONF_KEEP_FRAC,
-                     min_frames: int = _CALIB_MIN_DWELL) -> list:
-    """Robust feature vector for one calibration point.
+def _aggregate_dwell(valid_df, ts_center: int, feat_cols: list, lo_ns: int, hi_ns: int,
+                     radius: float = _CALIB_PLATEAU_R,
+                     seed_n: int = _CALIB_SEED_FRAMES) -> list:
+    """Robust feature vector for one calibration point: the median of the fixation
+    plateau the mark sits on.
 
-    The user fixates the target for a while, so instead of the single nearest
-    frame (noise-sensitive) we aggregate the fixation window:
-      1. keep the highest-confidence fraction of the window — low-confidence
-         detections corrupt the feature even when the detector "succeeded", and
-         this is what rescues the noisier calibrations;
-      2. take the median of the survivors (robust to the remaining minority of
-         off-target frames, e.g. a saccade at the window edge).
-    Falls back to the single nearest frame when the window is too sparse.
+    Seeded with the median of the few frames around the mark, the window then grows
+    outwards for as long as the pupil stays within `radius` of that seed, and never
+    past (lo_ns, hi_ns) — the midpoints to the neighbouring calibration points.
+
+    Growing by pupil PROXIMITY is what makes this correct. The previous version took
+    a fixed +-500 ms window and kept its highest-confidence half, but the targets are
+    only ~7 px apart in the eye image and the neighbouring fixation is often the more
+    confident one, so the ranking silently returned the WRONG target's pupil —
+    leave-one-out error 110 px on a noisy recording, 16 px with the plateau.
     """
     ts = valid_df["timestamp_ns"].to_numpy(np.int64)
-    sel = valid_df[np.abs(ts - ts_center) <= half_win_ns]
-    if len(sel) < min_frames:
-        idx = (valid_df["timestamp_ns"] - ts_center).abs().idxmin()
-        return [float(valid_df.loc[idx, c]) for c in feat_cols]
-    if conf_col is not None and sel[conf_col].notna().any():
-        k = max(min_frames, int(len(sel) * keep_frac))
-        sel = sel.nlargest(k, conf_col)
-    return list(np.median(sel[feat_cols].to_numpy(np.float64), axis=0))
+    feats = valid_df[feat_cols].to_numpy(np.float64)
+    if len(ts) == 0:
+        return [float("nan")] * len(feat_cols)
+
+    i = int(np.argmin(np.abs(ts - ts_center)))
+    # `valid_df` holds only the frames where BOTH pupils were detected, so the
+    # nearest one can be far from the mark — and `argmin` has no distance bound.
+    # On a recording where detection drops out around a target (Melissa_2: two
+    # marks with zero usable frames anywhere in their plateau) the seed then comes
+    # from a NEIGHBOURING target's fixation, 0.6-1.3 s away, and the point enters
+    # the fit as a confident measurement of the wrong gaze direction. The plateau
+    # bounds already say how far a mark's own fixation can possibly reach, so a
+    # seed outside them means this point has no data of its own: return NaN and
+    # let the caller's `dropna` drop it, which also makes `n_calib` honest.
+    if not (lo_ns <= ts[i] <= hi_ns):
+        return [float("nan")] * len(feat_cols)
+    seed = np.median(feats[max(0, i - seed_n): i + seed_n + 1], axis=0)
+    a = b = i
+    while a - 1 >= 0 and ts[a - 1] >= lo_ns and np.linalg.norm(feats[a - 1] - seed) <= radius:
+        a -= 1
+    while b + 1 < len(ts) and ts[b + 1] <= hi_ns and np.linalg.norm(feats[b + 1] - seed) <= radius:
+        b += 1
+    return list(np.median(feats[a:b + 1], axis=0))
+
+
+def _plateau_bounds(ts_marks: list) -> list:
+    """Per-mark ``(lo_ns, hi_ns)`` the plateau search may not leave.
+
+    Half-way to the neighbouring mark (minus a guard), capped at _CALIB_DWELL_MS.
+    Neighbours are taken in TIME order, so the point list may be in any order."""
+    span = int(_CALIB_DWELL_MS * 1e6)
+    guard = int(_CALIB_GUARD_MS * 1e6)
+    ordered = sorted(ts_marks)
+    bounds = []
+    for t in ts_marks:
+        lo, hi = t - span, t + span
+        prev = [u for u in ordered if u < t]
+        nxt = [u for u in ordered if u > t]
+        if prev:
+            lo = max(lo, (prev[-1] + t) // 2 + guard)
+        if nxt:
+            hi = min(hi, (t + nxt[0]) // 2 - guard)
+        bounds.append((lo, hi))
+    return bounds
 
 
 def _run_pupil_detection(recording_id: str, eye_path: str, folder_path: str, out_csv: Path, cfg: DetectRequest):
@@ -1326,16 +1365,7 @@ async def map_gaze(recording_id: str, source: Optional[str] = None, resample_30f
     base_features = ["xm", "ym"]
     all_features = base_features
 
-    # Per-frame confidence (worse of the two eyes) — used to keep only the
-    # highest-confidence frames inside each calibration fixation window.
-    conf_col = None
-    if {"confidence_L", "confidence_R"}.issubset(pupils.columns):
-        for col in ("confidence_L", "confidence_R"):
-            pupils[col] = pd.to_numeric(pupils[col], errors="coerce")
-        pupils["cmin"] = pupils[["confidence_L", "confidence_R"]].min(axis=1)
-        conf_col = "cmin"
-
-    # ── 5. Match calibration points to the fixation window (median-aggregated) ─
+    # ── 5. Match calibration points to their fixation plateau (median-aggregated) ─
     valid_mask = pupils[base_features].notna().all(axis=1)
     pupils_valid = pupils[valid_mask].reset_index(drop=True)
 
@@ -1349,12 +1379,13 @@ async def map_gaze(recording_id: str, source: Optional[str] = None, resample_30f
     # Frontend saves timestamp_ns = seekTime * 1e9 (seconds from scene video start).
     # Scene and eye cameras are hardware-synced on Neon: both cover [t0, t1], so a
     # calibration point at seekTime maps to absolute timestamp t0 + seekTime_ns.
-    # Aggregate the pupil over the fixation window (not one frame) to cut noise.
-    half_win_ns = int(_CALIB_DWELL_MS * 1e6)
+    # Aggregate the pupil over the whole fixation plateau (not one frame) to cut
+    # noise, bounded so a plateau can never reach into the neighbouring target.
+    ts_marks = [t0 + cp["timestamp_ns"] for cp in calib_points]
     merged_rows = []
-    for cp in calib_points:
+    for cp, (lo_ns, hi_ns) in zip(calib_points, _plateau_bounds(ts_marks)):
         ts = t0 + cp["timestamp_ns"]
-        feats = _aggregate_dwell(pupils_valid, ts, all_features, half_win_ns, conf_col=conf_col)
+        feats = _aggregate_dwell(pupils_valid, ts, all_features, lo_ns, hi_ns)
         merged_rows.append({
             "point_id": cp["point_id"],
             **{f: v for f, v in zip(all_features, feats)},
@@ -2168,7 +2199,7 @@ def _build_homographies(scene_path: str, registry: Optional[dict],
     if not registry or not _APRILTAG_AVAILABLE:
         return scene_ts, homographies
 
-    detector = _make_apriltag_detector(_BULK_QUAD_DECIMATE, _BULK_NTHREADS)
+    detector = TagDetector(_BULK_QUAD_DECIMATE, _BULK_NTHREADS)
     cap = cv2.VideoCapture(scene_path)
     frame_idx = 0
     while True:
@@ -2182,6 +2213,7 @@ def _build_homographies(scene_path: str, registry: Optional[dict],
         frame_idx += 1
 
     cap.release()
+    detector.close()
     return scene_ts, homographies
 
 

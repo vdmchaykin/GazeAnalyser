@@ -28,7 +28,9 @@ import numpy as np
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from app.api.routes.aoi import _get_recording, _load_scene_timestamps
+from app.api.routes.aoi import (
+    MAX_CONSECUTIVE_READ_FAILURES, _get_recording, _load_scene_timestamps,
+)
 
 router = APIRouter(prefix="/api/recordings/{recording_id}/motion", tags=["motion"])
 
@@ -129,6 +131,8 @@ def _run_scene_motion(recording_id: str, scene_video: str, folder_path: str) -> 
         scale = 1.0
         solved = 0
 
+        dropped = 0
+        misses = 0
         with open(part, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(_MOTION_COLS)
@@ -136,9 +140,26 @@ def _run_scene_motion(recording_id: str, scene_video: str, folder_path: str) -> 
             while True:
                 if job.get("cancelled"):
                     break
+                if total and idx >= total:
+                    break
                 ok, frame = cap.read()
                 if not ok:
-                    break
+                    # An undecodable frame, not the end of the file (see
+                    # MAX_CONSECUTIVE_READ_FAILURES). Leave its pair unsolved and
+                    # keep `prev_gray`: the next readable frame is then matched
+                    # against the last good one, and since the skipped row acts as
+                    # the identity when the chain is composed, that longer step
+                    # lands exactly where it should.
+                    misses += 1
+                    if misses > MAX_CONSECUTIVE_READ_FAILURES:
+                        break
+                    dropped += 1
+                    ts = int(timestamps[idx]) if idx < len(timestamps) else ""
+                    writer.writerow([idx, ts, *[""] * 8, 0])
+                    idx += 1
+                    job["progress"] = idx
+                    continue
+                misses = 0
                 if idx == 0:
                     scale = min(1.0, _TRACK_WIDTH / float(frame.shape[1]))
                 gray = _prep(frame, scale)
@@ -167,13 +188,22 @@ def _run_scene_motion(recording_id: str, scene_video: str, folder_path: str) -> 
                 job["solved"] = solved
         cap.release()
 
+        job["dropped"] = dropped
         if job.get("cancelled"):
             part.unlink(missing_ok=True)
             job["status"] = "cancelled"
             job["message"] = "Cancelled"
+        elif total and idx < total:
+            # A short file would still be published as finished and every frame
+            # past the cut would silently lose its transform.
+            part.unlink(missing_ok=True)
+            job["status"] = "error"
+            job["message"] = (f"Scene video could not be decoded past frame {idx} of {total} — "
+                              f"the file may be damaged")
         else:
             part.replace(out_csv)
             job["solved"] = solved
+            job["message"] = f"{dropped} undecodable frame(s) skipped" if dropped else ""
             job["status"] = "done"
     except Exception as e:  # pragma: no cover - surfaced via the status endpoint
         job["status"] = "error"

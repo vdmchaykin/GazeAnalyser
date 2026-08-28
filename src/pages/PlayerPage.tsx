@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ArrowLeft, Play, ChevronRight } from "lucide-react";
 import { api } from "@/lib/api";
+import { tourAnchor } from "@/lib/tour/anchors";
 import { formatDuration, formatDate } from "@/lib/utils";
 import { VideoPlayer } from "@/components/player/VideoPlayer";
 import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
@@ -48,7 +49,7 @@ export function PlayerPage({ recordingId, initialRecording, onBack }: PlayerPage
   if (!selectedId) {
     return (
       <div className="flex h-full">
-        <div className="w-80 border-r border-zinc-800 flex flex-col">
+        <div className="w-80 border-r border-zinc-800 flex flex-col" {...tourAnchor("player.recordingList")}>
           <div className="flex-1 overflow-auto">
             {loadingRecs ? (
               <p className="text-zinc-500 text-xs p-4">Loading…</p>
@@ -90,6 +91,7 @@ export function PlayerPage({ recordingId, initialRecording, onBack }: PlayerPage
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-3 px-4 h-12 border-b border-zinc-800 shrink-0">
         <button
+          {...tourAnchor("player.back")}
           onClick={handleBack}
           className="flex items-center gap-1.5 text-zinc-400 hover:text-white
                      transition-colors text-sm cursor-pointer"

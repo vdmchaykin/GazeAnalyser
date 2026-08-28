@@ -9,6 +9,8 @@ import { GazeMapStep } from "@/components/gaze/GazeMapStep";
 import { GazeFixationStep } from "@/components/gaze/GazeFixationStep";
 import { GazeSourceSelector } from "@/components/gaze/GazeSourceSelector";
 import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
+import { tourAnchor, type AnchorId } from "@/lib/tour/anchors";
+import { isDemoRecording } from "@/lib/tour/demo";
 
 const STEP_LABELS: Record<GazeStep, string> = {
   detect: "Pupils",
@@ -28,6 +30,14 @@ const STEP_DONE_FLAG: Record<GazeStep, keyof GazeAnalysisState> = {
 // Step numbers stay tied to the full pipeline, so "Step 3 — Gaze Mapping" means
 // the same thing whichever source is selected.
 const STEP_ORDER: GazeStep[] = ["detect", "calibrate", "map", "fixations"];
+
+// Tour hooks on the step indicator — the tour drives the wizard through these.
+const STEP_ANCHORS: Record<GazeStep, AnchorId> = {
+  detect: "gaze.stepDetect",
+  calibrate: "gaze.stepCalibrate",
+  map: "gaze.stepMap",
+  fixations: "gaze.stepFixations",
+};
 const stepNumber = (id: GazeStep) => STEP_ORDER.indexOf(id) + 1;
 
 const EMPTY_STATE: GazeAnalysisState = {
@@ -118,7 +128,7 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
   if (!selected) {
     return (
       <div className="flex h-full">
-        <div className="w-80 border-r border-zinc-800 flex flex-col">
+        <div className="w-80 border-r border-zinc-800 flex flex-col" {...tourAnchor("gaze.recordingList")}>
           <div className="flex-1 overflow-auto">
             {loadingRecs ? (
               <p className="text-zinc-500 text-xs p-4">Loading…</p>
@@ -131,6 +141,7 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
               recordings.map((rec) => (
                 <button
                   key={rec.id}
+                  {...(isDemoRecording(rec) ? tourAnchor("gaze.demoRecording") : {})}
                   onClick={() => handleSelectRecording(rec)}
                   className="w-full flex items-center gap-3 px-4 py-3 text-left
                              border-b border-zinc-800/50 hover:bg-zinc-900 transition-colors
@@ -169,18 +180,20 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
         <span className="text-zinc-700">|</span>
         <span className="text-sm font-medium text-white">{selected.name}</span>
 
+        <span {...tourAnchor("gaze.sourceSelector")}>
         <GazeSourceSelector
           value={analysisState.source}
           available={analysisState.available_sources}
           onChange={handleSourceChange}
           disabled={stateLoading || switchingSource}
         />
+        </span>
 
         <div className="flex-1" />
 
         {/* Step indicator — the cloud sources ship gaze instead of deriving it,
             so their wizard starts at Map and steps keep their original numbers. */}
-        <div className="flex items-center gap-0">
+        <div className="flex items-center gap-0" {...tourAnchor("gaze.stepIndicator")}>
           {steps.map((id, i) => {
             // A stage is "done" purely from its completion flag, independent of
             // which step is currently open — so a finished stage stays green
@@ -190,6 +203,7 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
             return (
               <div key={id} className="flex items-center">
                 <button
+                  {...tourAnchor(STEP_ANCHORS[id])}
                   onClick={() => setStep(id)}
                   className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium
                               transition-colors cursor-pointer

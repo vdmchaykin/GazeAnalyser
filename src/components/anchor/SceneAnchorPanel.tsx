@@ -11,18 +11,25 @@ export interface AnchorStats {
 }
 
 /**
- * Controls for the scanpath overlay's scene anchoring, plus the scene-motion job
- * that the fallback path depends on.
+ * Controls for an overlay's scene anchoring, plus the scene-motion job that the
+ * fallback path depends on. Shared by the scanpath overlay in the player and the
+ * calibration dots in the gaze wizard — both draw points measured in one frame
+ * while another is on screen.
  *
- * Two transports are available and the overlay picks per fixation: the AoI
- * surface homography (exact, needs surface_positions.csv) and scene egomotion
+ * Two transports are available and the overlay picks per point: the AoI surface
+ * homography (exact, needs surface_positions.csv) and scene egomotion
  * (approximate, needs scene_motion.csv). The live counters show which one is
  * actually carrying each frame, so a poor result is attributable rather than
  * mysterious.
  */
-export function ScanpathPanel({
+export function SceneAnchorPanel({
   recordingId, anchor, onAnchorChange, surfaceLocalized, motionSolved,
   statsRef, onMotionReady,
+  title = "Scanpath anchoring",
+  label = "Keep fixations on objects",
+  hintOn = "Past fixations are transported into the current frame.",
+  hintOff = "Past fixations stay at their original screen position.",
+  className = "absolute bottom-4 left-4 w-60 rounded-lg border border-zinc-700 bg-zinc-900/90 backdrop-blur px-3 py-2.5 shadow-xl shadow-black/50",
 }: {
   recordingId: string;
   anchor: boolean;
@@ -33,6 +40,11 @@ export function ScanpathPanel({
   motionSolved: number | null;
   statsRef: React.MutableRefObject<AnchorStats>;
   onMotionReady: () => void;
+  title?: string;
+  label?: string;
+  hintOn?: string;
+  hintOff?: string;
+  className?: string;
 }) {
   const [status, setStatus] = useState<SceneMotionStatus | null>(null);
   const [starting, setStarting] = useState(false);
@@ -97,14 +109,10 @@ export function ScanpathPanel({
     : 0;
 
   return (
-    <div
-      className="absolute bottom-4 left-4 w-60 rounded-lg border border-zinc-700
-                 bg-zinc-900/90 backdrop-blur px-3 py-2.5 shadow-xl shadow-black/50"
-      style={{ zIndex: 20 }}
-    >
+    <div className={className} style={{ zIndex: 20 }}>
       <p className="text-[11px] font-medium text-zinc-300 mb-2 flex items-center gap-1.5">
         <Anchor className="w-3 h-3 text-amber-400" />
-        Scanpath anchoring
+        {title}
       </p>
 
       <label className="flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
@@ -114,12 +122,10 @@ export function ScanpathPanel({
           onChange={(e) => onAnchorChange(e.target.checked)}
           className="accent-amber-500 cursor-pointer"
         />
-        Keep fixations on objects
+        {label}
       </label>
       <p className="text-[10px] text-zinc-600 mt-0.5 mb-2 leading-snug">
-        {anchor
-          ? "Past fixations are transported into the current frame."
-          : "Past fixations stay at their original screen position."}
+        {anchor ? hintOn : hintOff}
       </p>
 
       {anchor && (

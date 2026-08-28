@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Play, RefreshCw, CheckCircle2, PlayCircle, Trash2 } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
+import { tourAnchor } from "@/lib/tour/anchors";
 import type { CalibrationPoint, GazeAnalysisState, GazeSource, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
@@ -144,7 +145,8 @@ export function GazeMapStep({ recording, source, calibrationPoints, done: initia
           </label>
         </div>
       ) : (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-2">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-2"
+             {...tourAnchor("gaze.mapSummary")}>
           <p className="text-xs text-zinc-500 uppercase tracking-wider">Calibration Summary</p>
           <div className="flex items-center gap-6 text-sm">
             <span className="text-zinc-400">Points collected:</span>
@@ -167,7 +169,8 @@ export function GazeMapStep({ recording, source, calibrationPoints, done: initia
 
       {/* Results */}
       {done && result && (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4"
+             {...tourAnchor("gaze.mapResults")}>
           <div className="flex items-center gap-2 text-emerald-400">
             <CheckCircle2 className="w-5 h-5" />
             <span className="text-sm font-medium">Mapping complete</span>
@@ -234,6 +237,7 @@ export function GazeMapStep({ recording, source, calibrationPoints, done: initia
       {/* Actions */}
       <div className="flex gap-3">
         <button
+          {...tourAnchor("gaze.mapRun")}
           onClick={handleRun}
           disabled={running || (!isCloud && calibrationPoints.length === 0)}
           className="flex items-center gap-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500
@@ -248,6 +252,7 @@ export function GazeMapStep({ recording, source, calibrationPoints, done: initia
         </button>
         {done && (
           <button
+            {...tourAnchor("gaze.mapOpenPlayer")}
             onClick={() => onOpenPlayer(recording.id)}
             className="flex items-center gap-2 px-5 py-2 bg-emerald-700 hover:bg-emerald-600
                        text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"

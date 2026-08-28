@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { HelpCircle } from "lucide-react";
+import { GraduationCap, HelpCircle } from "lucide-react";
 import { HELP_CONTENT } from "@/lib/helpContent";
+import { tourAnchor } from "@/lib/tour/anchors";
+import { CHAPTERS, chapterForPage } from "@/lib/tour/steps";
+import { useTour } from "@/lib/tour/TourProvider";
 
 interface HelpButtonProps {
   page: string;
@@ -10,6 +13,8 @@ export function HelpButton({ page }: HelpButtonProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const help = HELP_CONTENT[page];
+  const tour = useTour();
+  const chapter = chapterForPage(page);
 
   useEffect(() => {
     if (!open) return;
@@ -30,7 +35,7 @@ export function HelpButton({ page }: HelpButtonProps) {
   if (!help) return null;
 
   return (
-    <div className="relative" ref={ref}>
+    <div className="relative" ref={ref} {...tourAnchor("topbar.help")}>
       <button
         onClick={() => setOpen((o) => !o)}
         title="Help"
@@ -48,6 +53,27 @@ export function HelpButton({ page }: HelpButtonProps) {
           {help.intro && (
             <p className="text-xs text-zinc-400 mb-3 leading-relaxed">{help.intro}</p>
           )}
+          {(chapter || CHAPTERS.length > 0) && (
+            <div className="mb-3 flex items-center gap-2 pb-3 border-b border-zinc-800">
+              <button
+                onClick={() => { setOpen(false); tour.start(chapter?.id); }}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-white
+                           bg-indigo-600 hover:bg-indigo-500 transition-colors cursor-pointer"
+              >
+                <GraduationCap className="w-3.5 h-3.5" />
+                {chapter ? "Show me around" : "Start the tour"}
+              </button>
+              {chapter && (
+                <button
+                  onClick={() => { setOpen(false); tour.start(); }}
+                  className="text-[11px] text-zinc-500 hover:text-zinc-300 cursor-pointer"
+                >
+                  Full tour
+                </button>
+              )}
+            </div>
+          )}
+
           <ol className="space-y-3">
             {help.sections.map((s, i) => (
               <li key={i} className="flex gap-3">

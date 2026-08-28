@@ -8,7 +8,8 @@ import type {
 import {
   applyMat, chainTo, matFrom8, nearestIndex, unitSquareToQuad, type Mat3,
 } from "@/lib/sceneAnchor";
-import { ScanpathPanel, type AnchorStats } from "./ScanpathPanel";
+import { tourAnchor } from "@/lib/tour/anchors";
+import { SceneAnchorPanel, type AnchorStats } from "@/components/anchor/SceneAnchorPanel";
 
 // Trailing time window (seconds) of fixations drawn in the scanpath overlay.
 const SCANPATH_WINDOW_S = 3;
@@ -753,6 +754,7 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       {/* Video container */}
       <div
         ref={containerRef}
+        {...tourAnchor("player.scene")}
         className="relative flex-1 overflow-hidden"
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -871,7 +873,7 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
 
         {/* Scanpath anchoring controls + the scene-motion job they depend on */}
         {showScanpath && (
-          <ScanpathPanel
+          <SceneAnchorPanel
             recordingId={recordingId}
             anchor={anchorScene}
             onAnchorChange={setAnchorScene}
@@ -897,9 +899,12 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
       </div>
 
       {/* Controls bar */}
-      <div className="flex flex-col gap-2 px-4 py-3 bg-zinc-900 border-t border-zinc-800">
+      <div
+        {...tourAnchor("player.controls")}
+        className="flex flex-col gap-2 px-4 py-3 bg-zinc-900 border-t border-zinc-800"
+      >
         {/* Seekbar */}
-        <div className="relative h-1.5 group">
+        <div className="relative h-1.5 group" {...tourAnchor("player.seekbar")}>
           <div className="absolute inset-0 bg-zinc-700 rounded-full" />
           <div
             className="absolute inset-y-0 left-0 bg-indigo-500 rounded-full pointer-events-none"
@@ -919,24 +924,26 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
 
         {/* Buttons row */}
         <div className="flex items-center gap-3">
-          <button onClick={togglePlay}
-            className="text-white hover:text-indigo-400 transition-colors cursor-pointer">
-            {playing ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
-          </button>
+          <div className="flex items-center gap-3" {...tourAnchor("player.transport")}>
+            <button onClick={togglePlay}
+              className="text-white hover:text-indigo-400 transition-colors cursor-pointer">
+              {playing ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
+            </button>
 
-          <button onClick={handleMute}
-            className="text-zinc-400 hover:text-white transition-colors cursor-pointer">
-            {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-          </button>
+            <button onClick={handleMute}
+              className="text-zinc-400 hover:text-white transition-colors cursor-pointer">
+              {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+            </button>
 
-          <span className="text-xs text-zinc-400 tabular-nums">
-            {formatTime(currentTime)} / {formatTime(duration)}
-          </span>
+            <span className="text-xs text-zinc-400 tabular-nums">
+              {formatTime(currentTime)} / {formatTime(duration)}
+            </span>
+          </div>
 
           <div className="flex-1" />
 
           {/* Speed */}
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1" {...tourAnchor("player.speed")}>
             {[0.1, 0.25, 0.5, 1, 2].map((s) => (
               <button
                 key={s}
@@ -949,77 +956,86 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
             ))}
           </div>
 
-          {/* Gaze overlay toggle */}
-          <button
-            onClick={() => setShowGaze((v) => !v)}
-            disabled={!avail.gaze}
-            title={!avail.gaze ? "No gaze data — run gaze mapping first" : showGaze ? "Hide gaze overlay" : "Show gaze overlay"}
-            className={`p-1.5 rounded transition-colors
-              disabled:opacity-30 disabled:cursor-not-allowed
-              ${avail.gaze ? "cursor-pointer" : ""}
-              ${showGaze ? "text-red-400 hover:text-red-300" : "text-zinc-600 hover:text-zinc-400"}`}
-          >
-            <ScanEye className="w-4 h-4" />
-          </button>
-
-          {/* Reference-gaze overlay toggle — draws Pupil Cloud's raw gaze ALONGSIDE
-              the mapped one for comparison. Unrelated to the Gaze section's source
-              selector, which picks what the whole pipeline runs on. */}
-          <button
-            onClick={() => setShowCloudGaze((v) => !v)}
-            disabled={!avail.cloud}
-            title={!avail.cloud
-              ? "No reference gaze — csv/gaze.csv not found"
-              : showCloudGaze ? "Hide reference gaze (Pupil Cloud)" : "Show reference gaze (Pupil Cloud)"}
-            className={`p-1.5 rounded transition-colors
-              disabled:opacity-30 disabled:cursor-not-allowed
-              ${avail.cloud ? "cursor-pointer" : ""}
-              ${showCloudGaze ? "text-sky-400 hover:text-sky-300" : "text-zinc-600 hover:text-zinc-400"}`}
-          >
-            <Cloud className="w-4 h-4" />
-          </button>
-
-          {/* Scanpath overlay toggle */}
-          <button
-            onClick={() => setShowScanpath((v) => !v)}
-            disabled={!avail.fixations}
-            title={!avail.fixations ? "No fixations — run fixation detection first" : showScanpath ? "Hide scanpath" : "Show scanpath (fixations)"}
-            className={`p-1.5 rounded transition-colors
-              disabled:opacity-30 disabled:cursor-not-allowed
-              ${avail.fixations ? "cursor-pointer" : ""}
-              ${showScanpath ? "text-amber-400 hover:text-amber-300" : "text-zinc-600 hover:text-zinc-400"}`}
-          >
-            <Route className="w-4 h-4" />
-          </button>
-
-          {/* Pupil overlay toggle */}
-          {hasEyeVideo && (
+          {/* Overlay toggles */}
+          <div className="flex items-center gap-3" {...tourAnchor("player.overlays")}>
+            {/* Gaze overlay toggle */}
             <button
-              onClick={() => setShowPupils((v) => !v)}
-              disabled={!avail.pupils}
-              title={!avail.pupils ? "No pupil data — run pupil detection first" : showPupils ? "Hide pupil overlay" : "Show pupil overlay"}
+              {...tourAnchor("player.gazeToggle")}
+              onClick={() => setShowGaze((v) => !v)}
+              disabled={!avail.gaze}
+              title={!avail.gaze ? "No gaze data — run gaze mapping first" : showGaze ? "Hide gaze overlay" : "Show gaze overlay"}
               className={`p-1.5 rounded transition-colors
                 disabled:opacity-30 disabled:cursor-not-allowed
-                ${avail.pupils ? "cursor-pointer" : ""}
-                ${showPupils ? "text-cyan-400 hover:text-cyan-300" : "text-zinc-600 hover:text-zinc-400"}`}
+                ${avail.gaze ? "cursor-pointer" : ""}
+                ${showGaze ? "text-red-400 hover:text-red-300" : "text-zinc-600 hover:text-zinc-400"}`}
             >
-              <CircleDot className="w-4 h-4" />
+              <ScanEye className="w-4 h-4" />
             </button>
-          )}
 
-          {/* Eye toggle */}
-          {hasEyeVideo && (
+            {/* Reference-gaze overlay toggle — draws Pupil Cloud's raw gaze ALONGSIDE
+                the mapped one for comparison. Unrelated to the Gaze section's source
+                selector, which picks what the whole pipeline runs on. */}
             <button
-              onClick={() => setShowEye(!showEye)}
-              title={showEye ? "Hide eye camera" : "Show eye camera"}
-              className={`p-1.5 rounded transition-colors cursor-pointer
-                ${showEye ? "text-indigo-400 hover:text-indigo-300" : "text-zinc-600 hover:text-zinc-400"}`}
+              {...tourAnchor("player.cloudGazeToggle")}
+              onClick={() => setShowCloudGaze((v) => !v)}
+              disabled={!avail.cloud}
+              title={!avail.cloud
+                ? "No reference gaze — csv/gaze.csv not found"
+                : showCloudGaze ? "Hide reference gaze (Pupil Cloud)" : "Show reference gaze (Pupil Cloud)"}
+              className={`p-1.5 rounded transition-colors
+                disabled:opacity-30 disabled:cursor-not-allowed
+                ${avail.cloud ? "cursor-pointer" : ""}
+                ${showCloudGaze ? "text-sky-400 hover:text-sky-300" : "text-zinc-600 hover:text-zinc-400"}`}
             >
-              {showEye ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+              <Cloud className="w-4 h-4" />
             </button>
-          )}
+
+            {/* Scanpath overlay toggle */}
+            <button
+              {...tourAnchor("player.scanpathToggle")}
+              onClick={() => setShowScanpath((v) => !v)}
+              disabled={!avail.fixations}
+              title={!avail.fixations ? "No fixations — run fixation detection first" : showScanpath ? "Hide scanpath" : "Show scanpath (fixations)"}
+              className={`p-1.5 rounded transition-colors
+                disabled:opacity-30 disabled:cursor-not-allowed
+                ${avail.fixations ? "cursor-pointer" : ""}
+                ${showScanpath ? "text-amber-400 hover:text-amber-300" : "text-zinc-600 hover:text-zinc-400"}`}
+            >
+              <Route className="w-4 h-4" />
+            </button>
+
+            {/* Pupil overlay toggle */}
+            {hasEyeVideo && (
+              <button
+                {...tourAnchor("player.pupilToggle")}
+                onClick={() => setShowPupils((v) => !v)}
+                disabled={!avail.pupils}
+                title={!avail.pupils ? "No pupil data — run pupil detection first" : showPupils ? "Hide pupil overlay" : "Show pupil overlay"}
+                className={`p-1.5 rounded transition-colors
+                  disabled:opacity-30 disabled:cursor-not-allowed
+                  ${avail.pupils ? "cursor-pointer" : ""}
+                  ${showPupils ? "text-cyan-400 hover:text-cyan-300" : "text-zinc-600 hover:text-zinc-400"}`}
+              >
+                <CircleDot className="w-4 h-4" />
+              </button>
+            )}
+
+            {/* Eye toggle */}
+            {hasEyeVideo && (
+              <button
+                {...tourAnchor("player.eyeToggle")}
+                onClick={() => setShowEye(!showEye)}
+                title={showEye ? "Hide eye camera" : "Show eye camera"}
+                className={`p-1.5 rounded transition-colors cursor-pointer
+                  ${showEye ? "text-indigo-400 hover:text-indigo-300" : "text-zinc-600 hover:text-zinc-400"}`}
+              >
+                {showEye ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+              </button>
+            )}
+          </div>
 
           <button
+            {...tourAnchor("player.fullscreen")}
             onClick={() => sceneRef.current?.requestFullscreen()}
             className="text-zinc-400 hover:text-white transition-colors cursor-pointer"
           >

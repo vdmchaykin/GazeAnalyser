@@ -42,6 +42,31 @@ export function matMul(a: Mat3, b: Mat3): Mat3 {
   return m;
 }
 
+/**
+ * Inverse of a homography (adjugate over determinant), or null if singular.
+ *
+ * Needed whenever a point has to travel BACKWARDS through a transform that was
+ * built in the forward direction — a scene point turned into surface coordinates
+ * through the frame it was measured in, or an egomotion chain read from a later
+ * frame towards an earlier one.
+ */
+export function invertMat(m: Mat3): Mat3 | null {
+  const a = m[0], b = m[1], c = m[2];
+  const d = m[3], e = m[4], f = m[5];
+  const g = m[6], h = m[7], i = m[8];
+  const A = e * i - f * h;
+  const B = f * g - d * i;
+  const C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  if (!Number.isFinite(det) || Math.abs(det) < EPS) return null;
+  const s = 1 / det;
+  return new Float64Array([
+    A * s, (c * h - b * i) * s, (b * f - c * e) * s,
+    B * s, (a * i - c * g) * s, (c * d - a * f) * s,
+    C * s, (b * g - a * h) * s, (a * e - b * d) * s,
+  ]);
+}
+
 export function applyMat(m: Mat3, x: number, y: number): [number, number] {
   const w = m[6] * x + m[7] * y + m[8];
   if (Math.abs(w) < EPS) return [x, y];

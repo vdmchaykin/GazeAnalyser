@@ -1,5 +1,6 @@
 import { Layers, Download, ScanEye, Flag, Target, FileText, ChartScatter, Play } from "lucide-react";
 import logo from "@/assets/logo.svg";
+import { tourAnchor, type AnchorId } from "@/lib/tour/anchors";
 import type { Page } from "@/types";
 
 interface SidebarProps {
@@ -7,10 +8,10 @@ interface SidebarProps {
   onChange: (page: Page) => void;
 }
 
-const topItems: { id: Page; label: string; Icon: React.ElementType }[] = [
-  { id: "projects", label: "Projects", Icon: Layers },
+const topItems: { id: Page; label: string; Icon: React.ElementType; anchor?: AnchorId }[] = [
+  { id: "projects", label: "Projects", Icon: Layers, anchor: "sidebar.projects" },
   { id: "player", label: "Player", Icon: Play },
-  { id: "gaze", label: "Gaze", Icon: ScanEye },
+  { id: "gaze", label: "Gaze", Icon: ScanEye, anchor: "sidebar.gaze" },
   { id: "events", label: "Events", Icon: Flag },
   { id: "aoi", label: "AoI", Icon: Target },
   { id: "surface", label: "Surface Map", Icon: FileText },
@@ -20,10 +21,14 @@ const topItems: { id: Page; label: string; Icon: React.ElementType }[] = [
 const exportItem = { id: "export" as Page, label: "Export", Icon: Download };
 
 function NavButton({
-  id, label, Icon, current, onChange,
-}: { id: Page; label: string; Icon: React.ElementType; current: Page; onChange: (p: Page) => void }) {
+  id, label, Icon, current, onChange, anchor,
+}: {
+  id: Page; label: string; Icon: React.ElementType; current: Page;
+  onChange: (p: Page) => void; anchor?: AnchorId;
+}) {
   return (
     <button
+      {...(anchor ? tourAnchor(anchor) : {})}
       onClick={() => onChange(id)}
       title={label}
       className={`
@@ -49,8 +54,11 @@ export function Sidebar({ current, onChange }: SidebarProps) {
       </div>
 
       <nav className="flex flex-col gap-3 p-2 flex-1">
-        {topItems.map(({ id, label, Icon }) => (
-          <NavButton key={id} id={id} label={label} Icon={Icon} current={current} onChange={onChange} />
+        {topItems.map(({ id, label, Icon, anchor }) => (
+          <NavButton
+            key={id} id={id} label={label} Icon={Icon} anchor={anchor}
+            current={current} onChange={onChange}
+          />
         ))}
         <div className="mt-auto">
           <NavButton {...exportItem} current={current} onChange={onChange} />

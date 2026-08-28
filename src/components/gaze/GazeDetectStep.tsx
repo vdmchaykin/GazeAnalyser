@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Play, RefreshCw, CheckCircle2, Trash2, ChevronDown, Eye } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
+import { tourAnchor } from "@/lib/tour/anchors";
 import type { GazeAnalysisState, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
@@ -267,7 +268,7 @@ export function GazeDetectStep({ recording, done: initialDone, onDone, onDeleted
       </div>
 
       {/* Configurators — floodfill (primary) beside edge-based (fallback) */}
-      <div className="grid grid-cols-2 gap-6 items-start">
+      <div className="grid grid-cols-2 gap-6 items-start" {...tourAnchor("gaze.detectConfig")}>
         {/* Floodfill config — collapsible */}
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-3">
           <button
@@ -354,7 +355,8 @@ export function GazeDetectStep({ recording, done: initialDone, onDone, onDeleted
       </div>
 
       {/* Detector preview — floodfill stages for a single frame, collapsible */}
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4"
+           {...tourAnchor("gaze.detectPreview")}>
         <button
           onClick={() => setPreviewOpen((v) => !v)}
           className="w-full flex items-center justify-between text-xs text-zinc-500 uppercase
@@ -494,7 +496,8 @@ export function GazeDetectStep({ recording, done: initialDone, onDone, onDeleted
       </div>
 
       {/* Status / progress */}
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-3">
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-3"
+           {...tourAnchor("gaze.detectStatus")}>
         {done ? (
           <div className="flex items-center gap-3 text-emerald-400">
             <CheckCircle2 className="w-5 h-5" />
@@ -545,6 +548,7 @@ export function GazeDetectStep({ recording, done: initialDone, onDone, onDeleted
           </button>
         ) : (
           <button
+            {...tourAnchor("gaze.detectRun")}
             onClick={handleRun}
             disabled={!recording.eye_video}
             className="flex items-center gap-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500

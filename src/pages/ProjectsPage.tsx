@@ -8,6 +8,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
 import { formatDuration, formatDate } from "@/lib/utils";
 import { confirmDialog } from "@/components/ConfirmDialog";
+import { tourAnchor, type AnchorId } from "@/lib/tour/anchors";
+import { emitTourEvent } from "@/lib/tour/events";
+import { isDemoRecording } from "@/lib/tour/demo";
 import type { Project, ProjectRef, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
@@ -65,6 +68,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
     setOpenProject(project);
     setSelectedRec(null);
     setView("project");
+    emitTourEvent("project:opened");
     try {
       const recs = await api.get<RecordingMeta[]>(`/api/projects/${project.id}/recordings`);
       setProjectRecs(recs);
@@ -99,6 +103,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
       }
       await fetchProjects();
       await fetchAllRecs();
+      emitTourEvent("recording:added");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Import failed");
     } finally {
@@ -118,6 +123,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
       setProjectRecs(recs);
       await fetchProjects();
       await fetchAllRecs();
+      emitTourEvent("recording:added");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Failed to add recording");
     } finally {
@@ -132,6 +138,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
       setNewProjectName("");
       setCreatingProject(false);
       await fetchProjects();
+      emitTourEvent("project:created");
     } catch {
       setError("Failed to create project");
     }
@@ -174,6 +181,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
 
   // Open a recording from the "All Recordings" list (no project context)
   const handleOpenRecording = (rec: RecordingMeta) => {
+    emitTourEvent("recording:selected");
     setOpenProject(null);
     setSelectedRec(rec);
     setView("recording");
@@ -201,8 +209,12 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
     return (
       <div className="flex flex-col h-full">
         {creatingProject && (
-          <div className="px-6 py-3 border-b border-zinc-800 flex items-center gap-2">
+          <div
+            {...tourAnchor("projects.newProjectForm")}
+            className="px-6 py-3 border-b border-zinc-800 flex items-center gap-2"
+          >
             <input
+              {...tourAnchor("projects.nameInput")}
               autoFocus
               value={newProjectName}
               onChange={(e) => setNewProjectName(e.target.value)}
@@ -215,6 +227,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
                          border border-zinc-700 focus:border-indigo-500 placeholder:text-zinc-600"
             />
             <button onClick={handleCreateProject}
+              {...tourAnchor("projects.createButton")}
               className="text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded cursor-pointer">
               Create
             </button>
@@ -241,6 +254,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
                   key={project.id}
                   project={project}
                   color={color}
+                  anchor={i === 0 ? "projects.projectTile" : undefined}
                   onClick={() => handleOpenProject(project)}
                   onDelete={() => handleDeleteProject(project.id)}
                 />
@@ -249,6 +263,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
 
             {/* Add project tile */}
             <button
+              {...tourAnchor("projects.newProjectTile")}
               onClick={() => setCreatingProject(true)}
               className="aspect-square rounded-2xl border border-dashed border-zinc-700
                          flex flex-col items-center justify-center gap-2
@@ -337,6 +352,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
         )}
         <div className="ml-auto relative">
           <button
+            {...tourAnchor("project.addRecording")}
             onClick={() => setImportMenuOpen((v) => !v)}
             disabled={importing}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-white
@@ -350,9 +366,12 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
           {importMenuOpen && (
             <>
               <div className="fixed inset-0 z-10" onClick={() => setImportMenuOpen(false)} />
-              <div className="absolute right-0 mt-1.5 w-64 z-20 rounded-xl border border-zinc-700
+              <div
+                {...tourAnchor("project.importMenu")}
+                className="absolute right-0 mt-1.5 w-64 z-20 rounded-xl border border-zinc-700
                               bg-zinc-900 shadow-xl shadow-black/40 overflow-hidden py-1">
                 <button
+                  {...tourAnchor("project.addExisting")}
                   onClick={() => { setImportMenuOpen(false); setPickingExisting(true); }}
                   className="w-full flex items-start gap-3 px-3 py-2.5 text-left
                              hover:bg-zinc-800 transition-colors cursor-pointer"
@@ -364,6 +383,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
                   </div>
                 </button>
                 <button
+                  {...tourAnchor("project.importNew")}
                   onClick={handleImport}
                   className="w-full flex items-start gap-3 px-3 py-2.5 text-left
                              hover:bg-zinc-800 transition-colors cursor-pointer"
@@ -457,7 +477,7 @@ function AllRecordingsSection({
   importing: boolean;
 }) {
   return (
-    <div className="mt-8">
+    <div className="mt-8" {...tourAnchor("projects.allRecordings")}>
       <div className="flex items-center gap-3 mb-3">
         <h3 className="text-sm font-semibold text-zinc-300">All Recordings</h3>
         <span className="text-xs text-zinc-600">{recordings.length}</span>
@@ -616,15 +636,16 @@ function AllRecordingsRow({
 // ─── ProjectTile ──────────────────────────────────────────────────────────────
 
 function ProjectTile({
-  project, color, onClick, onDelete,
+  project, color, onClick, onDelete, anchor,
 }: {
   project: Project;
   color: typeof TILE_COLORS[number];
   onClick: () => void;
   onDelete: () => void;
+  anchor?: AnchorId;
 }) {
   return (
-    <div className="relative group aspect-square">
+    <div className="relative group aspect-square" {...(anchor ? tourAnchor(anchor) : {})}>
       <button
         onClick={onClick}
         className={`w-full h-full rounded-2xl border ${color.border} ${color.bg} ${color.hover}
@@ -720,9 +741,10 @@ function ProjectOverview({
       {total > 0 ? (
         <div>
           <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
-            {recordings.map((rec) => (
+            {recordings.map((rec, i) => (
               <button
                 key={rec.id}
+                {...(i === 0 ? tourAnchor("project.recordingTile") : {})}
                 onClick={() => onSelect(rec)}
                 className="group text-left rounded-xl border border-zinc-800 bg-zinc-900/60
                            hover:border-zinc-600 hover:bg-zinc-800/80 transition-all cursor-pointer
@@ -819,9 +841,10 @@ function RecordingDetail({
       </div>
 
       {/* Right: actions */}
-      <div className="w-72 shrink-0 space-y-3 pt-1">
+      <div className="w-72 shrink-0 space-y-3 pt-1" {...tourAnchor("recording.actions")}>
         <p className="text-xs text-zinc-600 uppercase tracking-wider">Actions</p>
         <ActionButton
+          anchor="recording.calculateGaze"
           icon={<Brain className="w-4 h-4" />}
           label="Calculate Gaze"
           description="Detect pupils, calibrate & map gaze"
@@ -844,14 +867,16 @@ function RecordingDetail({
   );
 }
 
-function ActionButton({ icon, label, description, onClick }: {
+function ActionButton({ icon, label, description, onClick, anchor }: {
   icon: React.ReactNode;
   label: string;
   description: string;
   onClick: () => void;
+  anchor?: AnchorId;
 }) {
   return (
     <button
+      {...(anchor ? tourAnchor(anchor) : {})}
       onClick={onClick}
       className="w-full flex items-center gap-3 px-4 py-3
                  bg-zinc-800/60 hover:bg-zinc-800 border border-zinc-700/50
@@ -959,6 +984,7 @@ function ExistingRecordingPicker({
                 return (
                   <button
                     key={rec.id}
+                    {...(isDemoRecording(rec) ? tourAnchor("picker.demoRecording") : {})}
                     onClick={() => toggle(rec.id)}
                     className={`w-full flex items-center gap-3 px-4 py-2.5 text-left
                                 transition-colors cursor-pointer
@@ -1001,6 +1027,7 @@ function ExistingRecordingPicker({
               Cancel
             </button>
             <button
+              {...(selected.size > 0 ? tourAnchor("picker.confirmAdd") : {})}
               onClick={() => onConfirm([...selected])}
               disabled={selected.size === 0}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg text-white
@@ -1075,7 +1102,11 @@ function VideoThumbnailLarge({ recordingId, onPlay }: { recordingId: string; onP
   }
 
   return (
-    <div className="relative group cursor-pointer" onClick={onPlay}>
+    <div
+      {...tourAnchor("recording.videoPreview")}
+      className="relative group cursor-pointer"
+      onClick={onPlay}
+    >
       <img
         src={`${API}/api/recordings/${recordingId}/gaze/frame?frac=0.15`}
         className="w-full aspect-video rounded-xl object-cover bg-zinc-800"
