@@ -474,11 +474,8 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
           />
         ) : (
           <ProjectOverview
-            project={openProject!}
             recordings={projectRecs}
             onSelect={setSelectedRec}
-            onOpenPlayer={onOpenPlayer}
-            onImport={handleImport}
           />
         )}
       </div>
@@ -778,67 +775,14 @@ function ProjectTile({
   );
 }
 
-// ─── RecordingListItem ────────────────────────────────────────────────────────
-
-function RecordingListItem({
-  rec, selected, onSelect, onRemove,
-}: {
-  rec: RecordingMeta;
-  selected: boolean;
-  onSelect: () => void;
-  onRemove: () => void;
-}) {
-  return (
-    <button
-      onClick={onSelect}
-      className={`w-full flex items-center gap-2.5 px-3 py-2.5 text-left
-                  border-b border-zinc-800/40 transition-colors group cursor-pointer
-                  ${selected
-                    ? "bg-indigo-600/10 border-l-2 border-l-indigo-500"
-                    : "hover:bg-zinc-900/60"
-                  }`}
-    >
-      <VideoThumbnail recordingId={rec.id} />
-      <div className="flex-1 min-w-0">
-        <p className="text-xs font-medium text-white truncate">{rec.name}</p>
-        <p className="text-[10px] text-zinc-600 mt-0.5 flex items-center gap-1.5">
-          {rec.wearer_name && <span className="flex items-center gap-0.5"><User className="w-2.5 h-2.5" />{rec.wearer_name}</span>}
-          {rec.duration_sec != null && <span className="flex items-center gap-0.5"><Clock className="w-2.5 h-2.5" />{formatDuration(rec.duration_sec)}</span>}
-        </p>
-      </div>
-      <div className="flex flex-col items-end gap-1 shrink-0">
-        <span className={`text-[9px] px-1.5 py-0.5 rounded-full ${
-          rec.has_gaze_result
-            ? "bg-emerald-950 text-emerald-400 border border-emerald-800"
-            : "bg-zinc-800 text-zinc-600"
-        }`}>
-          {rec.has_gaze_result ? "Gaze ✓" : "–"}
-        </span>
-        <button
-          onClick={(e) => { e.stopPropagation(); onRemove(); }}
-          className="opacity-0 group-hover:opacity-100 p-0.5 text-zinc-600 hover:text-red-400
-                     transition-all cursor-pointer"
-          title="Remove from project"
-        >
-          <Trash2 className="w-3 h-3" />
-        </button>
-      </div>
-    </button>
-  );
-}
-
 // ─── ProjectOverview ──────────────────────────────────────────────────────────
 
 function ProjectOverview({
-  project, recordings, onSelect, onOpenPlayer, onImport,
+  recordings, onSelect,
 }: {
-  project: Project;
   recordings: RecordingMeta[];
   onSelect: (rec: RecordingMeta) => void;
-  onOpenPlayer: (id: string) => void;
-  onImport: () => void;
 }) {
-  const gazeCount = recordings.filter((r) => r.has_gaze_result).length;
   const total = recordings.length;
 
   return (

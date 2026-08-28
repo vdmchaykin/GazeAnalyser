@@ -1503,7 +1503,6 @@ function DrawCanvas({
   };
 
   const isBoxDrawing = tool === "rectangle" || tool === "ellipse";
-  const isDrawing = isBoxDrawing || tool === "polygon";
 
   const onMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;

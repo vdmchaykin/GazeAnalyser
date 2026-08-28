@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
 // ── Global imperative confirm dialog ─────────────────────────────────────────
 // Usage:  if (!(await confirmDialog({ message: "Delete this?" })) ) return;
