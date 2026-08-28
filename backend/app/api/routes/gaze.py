@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from app.database import get_db
 from app.api.routes.aoi import (
     _aoi_dir,
+    _get_recording,
     _gaze_dir,
     _build_recording_registry,
     TagDetector,
@@ -42,18 +43,6 @@ _detect_jobs: dict[str, dict] = {}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-async def _get_recording(recording_id: str) -> dict:
-    db = await get_db()
-    try:
-        cur = await db.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,))
-        row = await cur.fetchone()
-    finally:
-        await db.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return dict(row)
-
 
 # ── state ──────────────────────────────────────────────────────────────────
 
@@ -1136,7 +1125,7 @@ def _make_paper_projector(rec: dict):
     folder_path = rec["folder_path"]
     scene_path = rec.get("scene_video")
     if scene_path:
-        registry = _build_recording_registry(_aoi_dir(folder_path), scene_path)
+        registry = _build_recording_registry(rec, scene_path)
         scene_ts, homographies = _build_homographies(scene_path, registry, folder_path)
         # Keep the per-frame geometry: re-projecting the gaze (offset correction)
         # then costs milliseconds instead of another AprilTag pass over the video.
@@ -1638,7 +1627,7 @@ def _frame_homographies(rec: dict):
     scene_path = rec.get("scene_video")
     if not scene_path:
         return np.array([], dtype=np.int64), {}
-    registry = _build_recording_registry(adir, scene_path)
+    registry = _build_recording_registry(rec, scene_path)
     scene_ts, homographies = _build_homographies(scene_path, registry, folder_path)
     _save_frame_homographies(adir, scene_ts, homographies)
     return scene_ts, homographies

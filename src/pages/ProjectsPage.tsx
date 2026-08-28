@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import {
   Plus, Upload, X, Brain, Flag, Target, Trash2, Cpu, Clock,
   User, FolderOpen, ArrowLeft, CalendarClock, ChevronRight, Play,
-  LayoutGrid, List, FilePlus2, Library, ChevronDown, Check, Search,
+  LayoutGrid, List, FilePlus2, Library, ChevronDown, Check, Search, Pencil,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
@@ -42,6 +42,8 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
   const [pickingExisting, setPickingExisting] = useState(false);
   const [creatingProject, setCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
+  const [renamingOpenProject, setRenamingOpenProject] = useState(false);
+  const [openProjectNameDraft, setOpenProjectNameDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const fetchProjects = async () => {
@@ -141,6 +143,20 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
       emitTourEvent("project:created");
     } catch {
       setError("Failed to create project");
+    }
+  };
+
+  // Rename a project. Updates the grid and — when the project is currently
+  // open — its detail header too.
+  const handleRenameProject = async (id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    try {
+      const updated = await api.put<Project>(`/api/projects/${id}`, { name: trimmed });
+      setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, name: updated.name } : p)));
+      setOpenProject((prev) => (prev && prev.id === id ? { ...prev, name: updated.name } : prev));
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Failed to rename project");
     }
   };
 
@@ -256,6 +272,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
                   color={color}
                   anchor={i === 0 ? "projects.projectTile" : undefined}
                   onClick={() => handleOpenProject(project)}
+                  onRename={(name) => handleRenameProject(project.id, name)}
                   onDelete={() => handleDeleteProject(project.id)}
                 />
               );
@@ -343,7 +360,37 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
         >
           <ArrowLeft className="w-4 h-4" />
         </button>
-        <span className="text-xs text-zinc-500">{openProject?.name}</span>
+        {renamingOpenProject && openProject ? (
+          <input
+            autoFocus
+            value={openProjectNameDraft}
+            onChange={(e) => setOpenProjectNameDraft(e.target.value)}
+            onBlur={() => {
+              setRenamingOpenProject(false);
+              const name = openProjectNameDraft.trim();
+              if (name && name !== openProject.name) handleRenameProject(openProject.id, name);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+              if (e.key === "Escape") setRenamingOpenProject(false);
+            }}
+            className="bg-zinc-800 text-white text-xs px-2 py-1 rounded outline-none
+                       border border-zinc-700 focus:border-indigo-500 w-56"
+          />
+        ) : (
+          <button
+            onClick={() => {
+              setOpenProjectNameDraft(openProject?.name ?? "");
+              setRenamingOpenProject(true);
+            }}
+            title="Rename project"
+            className="group/name flex items-center gap-1.5 text-xs text-zinc-500
+                       hover:text-zinc-300 transition-colors cursor-pointer"
+          >
+            {openProject?.name}
+            <Pencil className="w-3 h-3 opacity-0 group-hover/name:opacity-100 transition-opacity" />
+          </button>
+        )}
         {selectedRec && (
           <>
             <span className="text-zinc-700">/</span>
@@ -636,39 +683,97 @@ function AllRecordingsRow({
 // ─── ProjectTile ──────────────────────────────────────────────────────────────
 
 function ProjectTile({
-  project, color, onClick, onDelete, anchor,
+  project, color, onClick, onRename, onDelete, anchor,
 }: {
   project: Project;
   color: typeof TILE_COLORS[number];
   onClick: () => void;
+  onRename: (name: string) => void;
   onDelete: () => void;
   anchor?: AnchorId;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(project.name);
+
+  const startRename = () => { setDraft(project.name); setEditing(true); };
+  const commitRename = () => {
+    if (!editing) return;
+    setEditing(false);
+    const name = draft.trim();
+    if (name && name !== project.name) onRename(name);
+  };
+
+  const tile = (
+    <>
+      <FolderOpen className={`w-10 h-10 ${color.icon}`} />
+      <div className="text-center w-full">
+        {editing ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={commitRename}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") { setEditing(false); setDraft(project.name); }
+            }}
+            className="w-full bg-zinc-900/80 text-white text-sm text-center px-2 py-1 rounded
+                       outline-none border border-zinc-600 focus:border-indigo-500"
+          />
+        ) : (
+          <p className="text-sm font-medium text-white leading-tight line-clamp-2">{project.name}</p>
+        )}
+        <p className="text-xs text-zinc-500 mt-1">
+          {project.recording_count} recording{project.recording_count !== 1 ? "s" : ""}
+        </p>
+      </div>
+    </>
+  );
+
   return (
     <div className="relative group aspect-square" {...(anchor ? tourAnchor(anchor) : {})}>
-      <button
-        onClick={onClick}
-        className={`w-full h-full rounded-2xl border ${color.border} ${color.bg} ${color.hover}
-                    flex flex-col items-center justify-center gap-3
-                    transition-all cursor-pointer p-4`}
-      >
-        <FolderOpen className={`w-10 h-10 ${color.icon}`} />
-        <div className="text-center">
-          <p className="text-sm font-medium text-white leading-tight line-clamp-2">{project.name}</p>
-          <p className="text-xs text-zinc-500 mt-1">
-            {project.recording_count} recording{project.recording_count !== 1 ? "s" : ""}
-          </p>
+      {editing ? (
+        <div
+          className={`w-full h-full rounded-2xl border ${color.border} ${color.bg}
+                      flex flex-col items-center justify-center gap-3 p-4`}
+        >
+          {tile}
         </div>
-      </button>
-      <button
-        onClick={(e) => { e.stopPropagation(); onDelete(); }}
-        className="absolute top-2 right-2 p-1 rounded-md
-                   opacity-0 group-hover:opacity-100
-                   text-zinc-600 hover:text-red-400 hover:bg-zinc-800
-                   transition-all cursor-pointer"
-      >
-        <Trash2 className="w-3.5 h-3.5" />
-      </button>
+      ) : (
+        <button
+          onClick={onClick}
+          onDoubleClick={(e) => { e.stopPropagation(); startRename(); }}
+          title="Double-click to rename"
+          className={`w-full h-full rounded-2xl border ${color.border} ${color.bg} ${color.hover}
+                      flex flex-col items-center justify-center gap-3
+                      transition-all cursor-pointer p-4`}
+        >
+          {tile}
+        </button>
+      )}
+      {!editing && (
+        <div className="absolute top-2 right-2 flex items-center gap-0.5
+                        opacity-0 group-hover:opacity-100 transition-all">
+          <button
+            onClick={(e) => { e.stopPropagation(); startRename(); }}
+            title="Rename project"
+            className="p-1 rounded-md text-zinc-600 hover:text-indigo-400 hover:bg-zinc-800
+                       transition-colors cursor-pointer"
+          >
+            <Pencil className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            title="Delete project"
+            className="p-1 rounded-md text-zinc-600 hover:text-red-400 hover:bg-zinc-800
+                       transition-colors cursor-pointer"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

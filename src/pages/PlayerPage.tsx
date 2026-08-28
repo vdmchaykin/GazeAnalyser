@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
-import { ArrowLeft, Play, ChevronRight } from "lucide-react";
+import { ArrowLeft, Play } from "lucide-react";
 import { api } from "@/lib/api";
 import { tourAnchor } from "@/lib/tour/anchors";
-import { formatDuration, formatDate } from "@/lib/utils";
 import { VideoPlayer } from "@/components/player/VideoPlayer";
-import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
+import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
 import type { RecordingMeta } from "@/types";
 
 interface PlayerPageProps {
@@ -48,42 +47,14 @@ export function PlayerPage({ recordingId, initialRecording, onBack }: PlayerPage
 
   if (!selectedId) {
     return (
-      <div className="flex h-full">
-        <div className="w-80 border-r border-zinc-800 flex flex-col" {...tourAnchor("player.recordingList")}>
-          <div className="flex-1 overflow-auto">
-            {loadingRecs ? (
-              <p className="text-zinc-500 text-xs p-4">Loading…</p>
-            ) : recordings.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12 text-zinc-600">
-                <Play className="w-8 h-8 mb-2 opacity-30" />
-                <p className="text-xs">No recordings yet</p>
-              </div>
-            ) : (
-              recordings.map((rec) => (
-                <button
-                  key={rec.id}
-                  onClick={() => setSelectedId(rec.id)}
-                  className="w-full flex items-center gap-3 px-4 py-3 text-left
-                             border-b border-zinc-800/50 hover:bg-zinc-900 transition-colors
-                             group cursor-pointer"
-                >
-                  <RecordingThumbnail recordingId={rec.id} />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-white truncate">{rec.name}</p>
-                    <p className="text-xs text-zinc-500">
-                      {rec.wearer_name} · {formatDuration(rec.duration_sec)} · {formatDate(rec.start_time)}
-                    </p>
-                  </div>
-                  <ChevronRight className="w-3.5 h-3.5 text-zinc-600" />
-                </button>
-              ))
-            )}
-          </div>
-        </div>
-        <div className="flex-1 flex items-center justify-center text-zinc-600">
-          <p className="text-sm">Select a recording to play the video</p>
-        </div>
-      </div>
+      <RecordingPickerScreen
+        recordings={recordings}
+        loading={loadingRecs}
+        onSelect={(rec) => setSelectedId(rec.id)}
+        containerProps={tourAnchor("player.recordingList")}
+        emptyIcon={Play}
+        placeholder="Select a recording to play the video"
+      />
     );
   }
 

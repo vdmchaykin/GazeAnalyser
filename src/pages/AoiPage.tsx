@@ -1,14 +1,15 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, type ReactNode } from "react";
 import {
   Plus, Eye, EyeOff, Trash2, MousePointer2, Square, Circle,
   Pencil, ChevronRight, ScanLine, Loader2,
   CheckCircle2, AlertCircle, CalendarClock, Save,
   Play, Pause, Volume2, VolumeX, ImageUp, Image as ImageIcon, Video, ChevronDown, Check,
+  FolderOpen,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { formatDuration, formatDate } from "@/lib/utils";
-import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
-import type { RecordingMeta, RecordingEvent } from "@/types";
+import { confirmDialog } from "@/components/ConfirmDialog";
+import { RecordingPicker } from "@/components/picker/RecordingPicker";
+import type { ProjectRef, RecordingMeta, RecordingEvent } from "@/types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,6 +32,42 @@ interface AoiArea {
 
 type DrawingTool = "select" | "rectangle" | "ellipse" | "polygon";
 
+/**
+ * What is being annotated. A project is the normal case: every recording in it
+ * looks at the same printed page, so the areas are drawn once and every recording
+ * reads them. Annotating a single recording writes an override, for the session
+ * that was shot with a different sheet.
+ */
+type AoiTarget =
+  | { kind: "project"; id: string; name: string }
+  | { kind: "recording"; id: string; name: string };
+
+type AoiScope = "project" | "recording" | "none";
+
+interface TargetContext {
+  target: AoiTarget;
+  /** Whose video supplies the reference frame, the tags and the surface run. */
+  source: RecordingMeta;
+  /** Every recording the annotation reaches — the project's, or just the one. */
+  recordings: RecordingMeta[];
+}
+
+/** Recordings in the project that annotate a segment themselves. */
+interface OverrideInfo {
+  recording_id: string;
+  name: string;
+  wearer_name?: string;
+  segments: string[];
+  shadowing: string[];
+}
+
+/** Where a target's AoI state lives. */
+function stateBase(target: AoiTarget): string {
+  return target.kind === "project"
+    ? `/api/projects/${target.id}/aoi`
+    : `/api/recordings/${target.id}/aoi`;
+}
+
 interface AoiSegmentMeta {
   id: string;
   label: string;
@@ -48,6 +85,13 @@ interface SegmentData {
   areas: AoiArea[];
   tagCount: number | null;
   selectedTags: TagInfo[] | null;   // tags defining the surface (for surface_positions.csv)
+  /** The surface registry the saved state carries, in normalized page coords.
+      Sent back untouched so a state inherited from the project keeps the geometry
+      its own frame produced; cleared when tags are picked anew, which is the
+      backend's cue to derive it again. */
+  markers: Record<string, number[][]> | null;
+  /** Whose annotation this is: the project's shared one, or a recording's override. */
+  scope: AoiScope;
 }
 
 interface TagInfo {
@@ -108,20 +152,21 @@ const emptySegmentData = (): SegmentData => ({
   areas: [],
   tagCount: null,
   selectedTags: null,
+  markers: null,
+  scope: "none",
 });
 
 // ─── Main page ────────────────────────────────────────────────────────────────
 
 export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta }) {
-  const [step, setStep] = useState<"recording" | "annotate">(
-    initialRecording ? "annotate" : "recording"
-  );
-  const [recording, setRecording] = useState<RecordingMeta | null>(initialRecording ?? null);
+  const [ctx, setCtx] = useState<TargetContext | null>(null);
   const [segments, setSegments] = useState<AoiSegmentMeta[]>([]);
   const [activeSegmentId, setActiveSegmentId] = useState<string>("general");
   const [segmentData, setSegmentData] = useState<Record<string, SegmentData>>({});
+  const [overrides, setOverrides] = useState<OverrideInfo[]>([]);
+  const [opening, setOpening] = useState(false);
 
-  const loadSegmentState = useCallback(async (recordingId: string, segmentId: string) => {
+  const loadSegmentState = useCallback(async (target: AoiTarget, segmentId: string) => {
     setSegmentData((prev) => ({
       ...prev,
       [segmentId]: { ...(prev[segmentId] ?? emptySegmentData()), loading: true },
@@ -136,7 +181,9 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
         using_reference?: boolean;
         tag_count: number | null;
         selected_tags?: TagInfo[] | null;
-      }>(`/api/recordings/${recordingId}/aoi/${segmentId}/state`);
+        markers?: Record<string, number[][]> | null;
+        scope?: AoiScope;
+      }>(`${stateBase(target)}/${segmentId}/state`);
       setSegmentData((prev) => ({
         ...prev,
         [segmentId]: {
@@ -151,6 +198,8 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
           areas: state.areas ?? [],
           tagCount: state.tag_count ?? null,
           selectedTags: state.selected_tags ?? null,
+          markers: state.markers ?? null,
+          scope: state.scope ?? "none",
         },
       }));
     } catch {
@@ -161,60 +210,99 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
     }
   }, []);
 
-  const loadSegments = useCallback(async (recordingId: string): Promise<AoiSegmentMeta[]> => {
-    let eventSegs: AoiSegmentMeta[] = [{ id: "general", label: "General", eventPrefix: null }];
-    try {
-      const evs = await api.get<RecordingEvent[]>(`/api/recordings/${recordingId}/events`);
-      eventSegs = deriveSegments(evs);
-    } catch { /* no events yet */ }
+  /**
+   * The tabs a target shows: one per test found in the events, plus General and
+   * any tab the user added by hand. A project unions the events of all its
+   * recordings, so a test only some sessions ran still gets a tab.
+   */
+  const loadSegments = useCallback(async (context: TargetContext): Promise<AoiSegmentMeta[]> => {
+    const events: RecordingEvent[] = [];
+    await Promise.all(context.recordings.map(async (rec) => {
+      try {
+        events.push(...await api.get<RecordingEvent[]>(`/api/recordings/${rec.id}/events`));
+      } catch { /* no events for this recording */ }
+    }));
+    const segs = deriveSegments(events);
 
     try {
       const manifest = await api.get<{ custom_segments: { id: string; label: string }[] }>(
-        `/api/recordings/${recordingId}/aoi/segments`
+        `${stateBase(context.target)}/segments`
       );
-      const eventIds = new Set(eventSegs.map((s) => s.id));
+      const known = new Set(segs.map((s) => s.id));
       for (const cs of manifest.custom_segments) {
-        if (!eventIds.has(cs.id)) {
-          eventSegs.push({ id: cs.id, label: cs.label, eventPrefix: null });
-        }
+        if (!known.has(cs.id)) segs.push({ id: cs.id, label: cs.label, eventPrefix: null });
       }
     } catch { /* no manifest yet */ }
 
-    return eventSegs;
+    return segs;
   }, []);
 
-  const saveSegmentsManifest = useCallback(async (recordingId: string, segs: AoiSegmentMeta[]) => {
+  const saveSegmentsManifest = useCallback(async (target: AoiTarget, segs: AoiSegmentMeta[]) => {
     const custom = segs.filter((s) => s.eventPrefix === null && s.id !== "general");
-    await api.post(`/api/recordings/${recordingId}/aoi/segments`, {
+    await api.post(`${stateBase(target)}/segments`, {
       custom_segments: custom.map((s) => ({ id: s.id, label: s.label })),
     });
   }, []);
 
-  useEffect(() => {
-    if (!initialRecording) return;
-    (async () => {
-      const segs = await loadSegments(initialRecording.id);
-      setSegments(segs);
-      setActiveSegmentId(segs[0].id);
-      await loadSegmentState(initialRecording.id, segs[0].id);
-    })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const loadOverrides = useCallback(async (target: AoiTarget) => {
+    if (target.kind !== "project") { setOverrides([]); return; }
+    try {
+      const res = await api.get<{ overrides: OverrideInfo[] }>(`${stateBase(target)}/overrides`);
+      setOverrides(res.overrides);
+    } catch {
+      setOverrides([]);
+    }
   }, []);
 
-  const handleSelectRecording = async (rec: RecordingMeta) => {
-    setRecording(rec);
+  const openTarget = useCallback(async (context: TargetContext) => {
+    setOpening(true);
+    setCtx(context);
     setSegmentData({});
-    const segs = await loadSegments(rec.id);
-    setSegments(segs);
-    setActiveSegmentId(segs[0].id);
-    setStep("annotate");
-    await loadSegmentState(rec.id, segs[0].id);
-  };
+    try {
+      const segs = await loadSegments(context);
+      setSegments(segs);
+      setActiveSegmentId(segs[0].id);
+      await Promise.all([
+        loadSegmentState(context.target, segs[0].id),
+        loadOverrides(context.target),
+      ]);
+    } finally {
+      setOpening(false);
+    }
+  }, [loadSegments, loadSegmentState, loadOverrides]);
+
+  /** Open one recording on its own — an override of whatever its project defines. */
+  const openRecording = useCallback((rec: RecordingMeta) => openTarget({
+    target: { kind: "recording", id: rec.id, name: rec.name },
+    source: rec,
+    recordings: [rec],
+  }), [openTarget]);
+
+  const openProject = useCallback(async (project: ProjectRef) => {
+    const recs = await api.get<RecordingMeta[]>(`/api/projects/${project.id}/recordings`);
+    if (recs.length === 0) return;
+    await openTarget({
+      target: { kind: "project", id: project.id, name: project.name },
+      // Any recording can supply the frame; the first one that has a video does.
+      source: recs.find((r) => r.scene_video) ?? recs[0],
+      recordings: recs,
+    });
+  }, [openTarget]);
+
+  // Arriving from another page with a recording in hand: annotate its project, so
+  // the work lands where every recording can see it.
+  useEffect(() => {
+    if (!initialRecording) return;
+    const project = initialRecording.projects?.[0];
+    if (project) openProject(project).catch(() => openRecording(initialRecording));
+    else openRecording(initialRecording);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleTabChange = async (segId: string) => {
     setActiveSegmentId(segId);
     if (!segmentData[segId]?.loaded && !segmentData[segId]?.loading) {
-      await loadSegmentState(recording!.id, segId);
+      await loadSegmentState(ctx!.target, segId);
     }
   };
 
@@ -232,6 +320,7 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
         refTimestamp: result.timestamp_s,
         tagCount: result.tag_count,
         selectedTags: result.selected_tags ?? null,
+        markers: null,
       },
     }));
   };
@@ -282,15 +371,16 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
         refTimestamp: null,
         tagCount: null,
         selectedTags: null,
+        markers: null,
       },
     }));
   };
 
   const handleSave = async () => {
-    if (!recording) return;
+    if (!ctx) return;
     const data = segmentData[activeSegmentId];
     if (!data) return;
-    await api.post(`/api/recordings/${recording.id}/aoi/${activeSegmentId}/state`, {
+    await api.post(`${stateBase(ctx.target)}/${activeSegmentId}/state`, {
       areas: data.areas,
       reference_timestamp_s: data.refTimestamp,
       warped_image_b64: data.warpedImage,
@@ -299,10 +389,56 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
       using_reference: data.usingReference,
       tag_count: data.tagCount,
       selected_tags: data.selectedTags,
+      markers: data.markers,
+      // The tags are in this recording's scene pixels; the backend turns them into
+      // the page-normalized registry the other recordings use.
+      ...(ctx.target.kind === "project" ? { source_recording_id: ctx.source.id } : {}),
     });
+    setSegmentData((prev) => ({
+      ...prev,
+      [activeSegmentId]: { ...prev[activeSegmentId], scope: ctx.target.kind },
+    }));
+    await loadOverrides(ctx.target);
+  };
+
+  /** Drop this recording's override so it follows its project's annotation again. */
+  const handleUseProjectAnnotation = async () => {
+    if (!ctx || ctx.target.kind !== "recording") return;
+    const ok = await confirmDialog({
+      title: "Use the project's annotation",
+      message: "This recording's own areas will be deleted and it will follow the "
+             + "project's annotation instead. This cannot be undone.",
+      confirmLabel: "Delete and follow project",
+    });
+    if (!ok) return;
+    await api.delete(`/api/recordings/${ctx.target.id}/aoi/${activeSegmentId}/state`);
+    await loadSegmentState(ctx.target, activeSegmentId);
+  };
+
+  /** Publish an existing per-recording annotation to the whole project. */
+  const handleSeedFromRecording = async (recordingId: string) => {
+    if (!ctx || ctx.target.kind !== "project") return;
+    await api.post(`${stateBase(ctx.target)}/seed`, { recording_id: recordingId });
+    // The areas now on screen were drawn on that recording's frame, so the editor
+    // follows it — the background and the tags have to be the ones they came from.
+    const source = ctx.recordings.find((r) => r.id === recordingId);
+    if (source) setCtx({ ...ctx, source });
+    setSegmentData({});
+    const segs = await loadSegments(ctx);
+    setSegments(segs);
+    await Promise.all([
+      loadSegmentState(ctx.target, activeSegmentId),
+      loadOverrides(ctx.target),
+    ]);
+  };
+
+  const handleChangeSource = async (rec: RecordingMeta) => {
+    if (!ctx) return;
+    setCtx({ ...ctx, source: rec });
   };
 
   const handleAddSegment = async (name: string) => {
+    if (!ctx) return;
     const id = name.trim().toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_-]/g, "").slice(0, 64);
     if (!id || segments.some((s) => s.id === id)) return;
     const newSeg: AoiSegmentMeta = { id, label: name.trim(), eventPrefix: null };
@@ -310,23 +446,25 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
     setSegments(updated);
     setActiveSegmentId(id);
     await Promise.all([
-      loadSegmentState(recording!.id, id),
-      saveSegmentsManifest(recording!.id, updated),
+      loadSegmentState(ctx.target, id),
+      saveSegmentsManifest(ctx.target, updated),
     ]);
   };
 
-  if (step === "recording") {
-    return <RecordingPicker onSelect={handleSelectRecording} />;
+  if (!ctx) {
+    return <AoiTargetPicker onSelectProject={openProject} onSelectRecording={openRecording} busy={opening} />;
   }
 
   return (
     <AnnotateView
-      recording={recording!}
+      ctx={ctx}
       segments={segments}
       activeSegmentId={activeSegmentId}
       segmentData={segmentData}
+      overrides={overrides}
       onTabChange={handleTabChange}
-      onBack={() => setStep("recording")}
+      onBack={() => { setCtx(null); setSegments([]); setSegmentData({}); }}
+      onChangeSource={handleChangeSource}
       onFrameConfirmed={handleFrameConfirmed}
       onReferenceConfirmed={handleReferenceConfirmed}
       onToggleBackground={handleToggleBackground}
@@ -334,6 +472,8 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
       onRedetect={handleRedetect}
       onSave={handleSave}
       onAddSegment={handleAddSegment}
+      onUseProjectAnnotation={handleUseProjectAnnotation}
+      onSeedFromRecording={handleSeedFromRecording}
     />
   );
 }
@@ -341,12 +481,14 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
 // ─── Annotate view: header + tabs + content ───────────────────────────────────
 
 function AnnotateView({
-  recording,
+  ctx,
   segments,
   activeSegmentId,
   segmentData,
+  overrides,
   onTabChange,
   onBack,
+  onChangeSource,
   onFrameConfirmed,
   onReferenceConfirmed,
   onToggleBackground,
@@ -354,13 +496,17 @@ function AnnotateView({
   onRedetect,
   onSave,
   onAddSegment,
+  onUseProjectAnnotation,
+  onSeedFromRecording,
 }: {
-  recording: RecordingMeta;
+  ctx: TargetContext;
   segments: AoiSegmentMeta[];
   activeSegmentId: string;
   segmentData: Record<string, SegmentData>;
+  overrides: OverrideInfo[];
   onTabChange: (id: string) => void;
   onBack: () => void;
+  onChangeSource: (rec: RecordingMeta) => void;
   onFrameConfirmed: (r: DetectResult) => void;
   onReferenceConfirmed: (warpB64: string) => void;
   onToggleBackground: () => void;
@@ -368,7 +514,11 @@ function AnnotateView({
   onRedetect: () => void;
   onSave: () => Promise<void>;
   onAddSegment: (name: string) => Promise<void>;
+  onUseProjectAnnotation: () => Promise<void>;
+  onSeedFromRecording: (recordingId: string) => Promise<void>;
 }) {
+  const recording = ctx.source;
+  const isProject = ctx.target.kind === "project";
   const activeData = segmentData[activeSegmentId];
   const [addingTab, setAddingTab] = useState(false);
   const [newTabName, setNewTabName] = useState("");
@@ -393,14 +543,40 @@ function AnnotateView({
           onClick={onBack}
           className="text-xs text-zinc-400 hover:text-white transition-colors cursor-pointer"
         >
-          ← All Recordings
+          ← All Projects
         </button>
         <span className="text-zinc-700">|</span>
-        <span className="text-sm font-medium text-white">{recording.name}</span>
-        {recording.wearer_name && (
-          <span className="text-xs text-zinc-500">{recording.wearer_name}</span>
+        {isProject ? <FolderOpen className="w-3.5 h-3.5 text-indigo-400" /> : null}
+        <span className="text-sm font-medium text-white">{ctx.target.name}</span>
+        <span className="text-xs text-zinc-500">
+          {isProject
+            ? `${ctx.recordings.length} recording${ctx.recordings.length === 1 ? "" : "s"} share these areas`
+            : "this recording only"}
+        </span>
+
+        {/* Which video the frame, the tags and the surface run come from. Any
+            recording of the project will do — they all show the same page. */}
+        {isProject && ctx.recordings.length > 1 && (
+          <div className="ml-auto flex items-center gap-2">
+            <span className="text-[11px] text-zinc-600">Frame from</span>
+            <SourceSelect
+              recordings={ctx.recordings}
+              value={recording}
+              onChange={onChangeSource}
+            />
+          </div>
         )}
       </div>
+
+      <ScopeNotice
+        ctx={ctx}
+        scope={segmentData[activeSegmentId]?.scope ?? "none"}
+        sourceId={recording.id}
+        activeSegmentId={activeSegmentId}
+        overrides={overrides}
+        onUseProjectAnnotation={onUseProjectAnnotation}
+        onSeedFromRecording={onSeedFromRecording}
+      />
 
       {/* Segment tabs */}
       <div className="flex items-center border-b border-zinc-800 px-2 shrink-0 bg-zinc-950">
@@ -461,15 +637,22 @@ function AnnotateView({
           onReferenceConfirmed={onReferenceConfirmed}
           onToggleBackground={onToggleBackground}
           onSave={onSave}
+          saveLabel={isProject ? "Save for project" : "Save"}
         />
       )}
     </div>
   );
 }
 
-// ─── Recording picker ─────────────────────────────────────────────────────────
+// ─── Target picker ────────────────────────────────────────────────────────────
 
-function RecordingPicker({ onSelect }: { onSelect: (r: RecordingMeta) => void }) {
+function AoiTargetPicker({
+  onSelectProject, onSelectRecording, busy,
+}: {
+  onSelectProject: (p: ProjectRef) => Promise<void>;
+  onSelectRecording: (r: RecordingMeta) => void;
+  busy: boolean;
+}) {
   const [recordings, setRecordings] = useState<RecordingMeta[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -481,41 +664,179 @@ function RecordingPicker({ onSelect }: { onSelect: (r: RecordingMeta) => void })
 
   return (
     <div className="flex h-full">
-      <div className="w-80 border-r border-zinc-800 flex flex-col">
-        <div className="flex-1 overflow-auto">
-          {loading ? (
-            <p className="text-zinc-500 text-xs p-4">Loading…</p>
-          ) : recordings.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-zinc-600">
-              <CalendarClock className="w-8 h-8 mb-2 opacity-30" />
-              <p className="text-xs">No recordings yet</p>
-            </div>
+      <RecordingPicker
+        recordings={recordings}
+        loading={loading}
+        onSelect={onSelectRecording}
+        onSelectProject={(p) => { onSelectProject(p); }}
+        emptyIcon={CalendarClock}
+      />
+      <div className="flex-1 flex items-center justify-center text-zinc-600 p-8">
+        <div className="max-w-md text-center">
+          {busy ? (
+            <Loader2 className="w-6 h-6 animate-spin mx-auto" />
           ) : (
-            recordings.map((rec) => (
-              <button
-                key={rec.id}
-                onClick={() => onSelect(rec)}
-                className="w-full flex items-center gap-3 px-4 py-3 text-left
-                           border-b border-zinc-800/50 hover:bg-zinc-900 transition-colors
-                           cursor-pointer"
-              >
-                <RecordingThumbnail recordingId={rec.id} />
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm text-white truncate">{rec.name}</p>
-                  <p className="text-xs text-zinc-500">
-                    {rec.wearer_name} · {formatDuration(rec.duration_sec)} · {formatDate(rec.start_time)}
-                  </p>
-                </div>
-                <ChevronRight className="w-3.5 h-3.5 text-zinc-600" />
-              </button>
-            ))
+            <>
+              <ImageIcon className="w-10 h-10 mb-3 mx-auto opacity-20" />
+              <p className="text-sm text-zinc-400">Pick a project to define its Areas of Interest</p>
+              <p className="text-xs mt-3 leading-relaxed">
+                Every recording in a project looks at the same printed page, so the areas
+                are drawn once and all of them use the result.
+              </p>
+              <p className="text-xs mt-2 leading-relaxed text-zinc-700">
+                Expand a project and pick a single recording only when that session used a
+                different sheet — its areas then override the project's, for that recording alone.
+              </p>
+            </>
           )}
         </div>
       </div>
-      <div className="flex-1 flex items-center justify-center text-zinc-600">
-        <p className="text-sm">Select a recording to define Areas of Interest</p>
-      </div>
     </div>
+  );
+}
+
+/** Which recording's video supplies the reference frame and the tag detection. */
+function SourceSelect({
+  recordings, value, onChange,
+}: {
+  recordings: RecordingMeta[];
+  value: RecordingMeta;
+  onChange: (rec: RecordingMeta) => void;
+}) {
+  return (
+    <select
+      value={value.id}
+      onChange={(e) => {
+        const rec = recordings.find((r) => r.id === e.target.value);
+        if (rec) onChange(rec);
+      }}
+      className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-200
+                 outline-none cursor-pointer max-w-[220px]"
+    >
+      {recordings.map((rec) => (
+        <option key={rec.id} value={rec.id} disabled={!rec.scene_video}>
+          {rec.wearer_name ? `${rec.wearer_name} — ${rec.name}` : rec.name}
+          {rec.scene_video ? "" : " (no video)"}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/**
+ * Says whose annotation is on screen, and offers the one move that changes it:
+ * publishing a recording's areas to its project, or dropping an override.
+ */
+function ScopeNotice({
+  ctx, scope, sourceId, activeSegmentId, overrides, onUseProjectAnnotation, onSeedFromRecording,
+}: {
+  ctx: TargetContext;
+  scope: AoiScope;
+  /** The recording currently supplying the frame — the one to adopt areas from. */
+  sourceId: string;
+  activeSegmentId: string;
+  overrides: OverrideInfo[];
+  onUseProjectAnnotation: () => Promise<void>;
+  onSeedFromRecording: (recordingId: string) => Promise<void>;
+}) {
+  const [working, setWorking] = useState(false);
+  const run = async (fn: () => Promise<void>) => {
+    setWorking(true);
+    try { await fn(); } finally { setWorking(false); }
+  };
+
+  if (ctx.target.kind === "recording") {
+    const project = ctx.source.projects?.[0];
+    if (scope === "recording" && project) {
+      return (
+        <Notice tone="warn">
+          <span>
+            These areas belong to this recording alone and override{" "}
+            <span className="text-zinc-300">{project.name}</span>'s shared annotation.
+          </span>
+          <NoticeButton busy={working} onClick={() => run(onUseProjectAnnotation)}>
+            Use the project's instead
+          </NoticeButton>
+        </Notice>
+      );
+    }
+    if (scope === "project" && project) {
+      return (
+        <Notice tone="info">
+          <span>
+            Showing <span className="text-zinc-300">{project.name}</span>'s shared areas.
+            Saving here overrides them for this recording only.
+          </span>
+        </Notice>
+      );
+    }
+    return null;
+  }
+
+  // Project target: offer to adopt an existing per-recording annotation, and name
+  // the recordings that will ignore this one.
+  const candidates = overrides.filter((o) => o.segments.includes(activeSegmentId));
+  if (scope === "none" && candidates.length > 0) {
+    // Offer the recording already on screen when it is one of them, so the button
+    // never names someone other than the frame the user is looking at.
+    const pick = candidates.find((o) => o.recording_id === sourceId) ?? candidates[0];
+    const who = pick.wearer_name || pick.name;
+    const others = candidates.length - 1;
+    return (
+      <Notice tone="info">
+        <span>
+          {who} already has areas for this test
+          {others > 0 && ` (and ${others} other recording${others === 1 ? "" : "s"})`}.
+        </span>
+        <NoticeButton busy={working} onClick={() => run(() => onSeedFromRecording(pick.recording_id))}>
+          Use {who}'s for the whole project
+        </NoticeButton>
+      </Notice>
+    );
+  }
+
+  const shadowing = overrides.filter((o) => o.shadowing.includes(activeSegmentId));
+  if (shadowing.length > 0) {
+    return (
+      <Notice tone="warn">
+        <span>
+          {shadowing.length} recording{shadowing.length === 1 ? "" : "s"} ignore these areas and
+          use their own: {shadowing.map((o) => o.wearer_name || o.name).join(", ")}.
+        </span>
+      </Notice>
+    );
+  }
+  return null;
+}
+
+function Notice({ tone, children }: { tone: "info" | "warn"; children: ReactNode }) {
+  return (
+    <div
+      className={`flex items-center gap-3 px-4 py-2 text-[11px] border-b border-zinc-800 shrink-0
+        ${tone === "warn" ? "bg-zinc-900 text-amber-500/90" : "bg-zinc-900 text-zinc-500"}`}
+    >
+      {tone === "warn"
+        ? <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+        : <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />}
+      {children}
+    </div>
+  );
+}
+
+function NoticeButton({
+  busy, onClick, children,
+}: { busy: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      className="ml-auto shrink-0 flex items-center gap-1 px-2 py-1 rounded text-[11px]
+                 text-indigo-400 hover:text-indigo-300 hover:bg-zinc-800
+                 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+    >
+      {busy && <Loader2 className="w-3 h-3 animate-spin" />}
+      {children}
+    </button>
   );
 }
 
@@ -1028,6 +1349,7 @@ function DrawCanvas({
   onReferenceConfirmed,
   onToggleBackground,
   onSave,
+  saveLabel,
 }: {
   recording: RecordingMeta;
   segmentId: string;
@@ -1041,6 +1363,8 @@ function DrawCanvas({
   onReferenceConfirmed: (warpB64: string) => void;
   onToggleBackground: () => void;
   onSave: () => Promise<void>;
+  /** Names who the save reaches — every recording in the project, or just this one. */
+  saveLabel: string;
 }) {
   const [showUpload, setShowUpload] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1394,7 +1718,7 @@ function DrawCanvas({
                        text-white text-xs rounded-md transition-colors cursor-pointer"
           >
             {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
-            {saveOk ? "Saved!" : saving ? "Saving…" : "Save"}
+            {saveOk ? "Saved!" : saving ? "Saving…" : saveLabel}
           </button>
           <button
             onClick={onRedetect}

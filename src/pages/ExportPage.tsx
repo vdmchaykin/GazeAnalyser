@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Activity, AlertCircle, ArrowRight, Check, Download, FolderOpen, Loader2, Package } from "lucide-react";
+import { AlertCircle, ArrowRight, Check, Download, Loader2, Package } from "lucide-react";
 import { api } from "@/lib/api";
 import { confirmDialog } from "@/components/ConfirmDialog";
-import { formatDuration, formatDate } from "@/lib/utils";
-import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
+import { RecordingPicker } from "@/components/picker/RecordingPicker";
 import { GAZE_SOURCE_LABELS, type GazeSource, type NavPage, type Project, type RecordingMeta } from "@/types";
 
 interface ExportFile {
@@ -158,46 +157,19 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
 
   return (
     <div className="flex h-full">
-      {/* Source picker */}
-      <div className="w-72 border-r border-zinc-800 flex flex-col shrink-0 overflow-y-auto">
-        {loading ? (
-          <p className="text-zinc-500 text-xs p-4">Loading…</p>
-        ) : (
-          <>
-            <p className="px-4 pt-3 pb-1 text-[10px] uppercase tracking-wider text-zinc-600">
-              Projects
-            </p>
-            {projects.length === 0 ? (
-              <p className="px-4 pb-2 text-[11px] text-zinc-600">No projects yet</p>
-            ) : projects.map(p => (
-              <SourceRow
-                key={p.id}
-                Icon={FolderOpen}
-                title={p.name}
-                subtitle={`${p.recording_count} recording${p.recording_count === 1 ? "" : "s"}`}
-                active={source?.kind === "project" && source.id === p.id}
-                onClick={() => select({ kind: "project", id: p.id, label: p.name })}
-              />
-            ))}
-
-            <p className="px-4 pt-3 pb-1 text-[10px] uppercase tracking-wider text-zinc-600">
-              Recordings
-            </p>
-            {recordings.length === 0 ? (
-              <p className="px-4 pb-2 text-[11px] text-zinc-600">No recordings yet</p>
-            ) : recordings.map(r => (
-              <SourceRow
-                key={r.id}
-                thumbnailId={r.id}
-                title={r.name}
-                subtitle={`${r.wearer_name} · ${formatDuration(r.duration_sec)} · ${formatDate(r.start_time)}`}
-                active={source?.kind === "recording" && source.id === r.id}
-                onClick={() => select({ kind: "recording", id: r.id, label: r.name })}
-              />
-            ))}
-          </>
-        )}
-      </div>
+      <RecordingPicker
+        className="w-72 border-r border-zinc-800"
+        recordings={recordings}
+        projects={projects}
+        loading={loading}
+        recordingsSection="all"
+        selectedRecordingId={source?.kind === "recording" ? source.id : null}
+        selectedProjectId={source?.kind === "project" ? source.id : null}
+        onSelect={(rec) => select({ kind: "recording", id: rec.id, label: rec.name })}
+        onSelectProject={(p) => select({ kind: "project", id: p.id, label: p.name })}
+        emptyIcon={Package}
+        emptyText="No recordings yet"
+      />
 
       {/* Files */}
       {!source ? (
@@ -288,36 +260,6 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
         </div>
       )}
     </div>
-  );
-}
-
-function SourceRow({
-  Icon, thumbnailId, title, subtitle, active, onClick,
-}: {
-  Icon?: typeof Activity;
-  /** When set, a scene-frame preview replaces the icon (used for recordings). */
-  thumbnailId?: string;
-  title: string;
-  subtitle: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full flex items-center gap-3 px-4 py-2.5 text-left border-b border-zinc-800/50
-        transition-colors cursor-pointer ${active ? "bg-zinc-800" : "hover:bg-zinc-900"}`}
-    >
-      {thumbnailId ? (
-        <RecordingThumbnail recordingId={thumbnailId} className="w-12 h-7 rounded shrink-0" />
-      ) : Icon ? (
-        <Icon className="w-4 h-4 shrink-0 text-indigo-400" />
-      ) : null}
-      <div className="flex-1 min-w-0">
-        <p className="text-sm text-white truncate">{title}</p>
-        <p className="text-[11px] text-zinc-500 truncate">{subtitle}</p>
-      </div>
-    </button>
   );
 }
 

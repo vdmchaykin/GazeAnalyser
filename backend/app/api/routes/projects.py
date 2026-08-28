@@ -13,6 +13,11 @@ class ProjectCreate(BaseModel):
     description: Optional[str] = None
 
 
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
 class ProjectOut(BaseModel):
     id: str
     name: str
@@ -55,6 +60,46 @@ async def create_project(body: ProjectCreate):
         cursor = await db.execute(
             "SELECT *, 0 as recording_count FROM projects WHERE id = ?", (project_id,)
         )
+        row = await cursor.fetchone()
+    finally:
+        await db.close()
+    return ProjectOut(**dict(row))
+
+
+@router.put("/{project_id}", response_model=ProjectOut)
+async def update_project(project_id: str, body: ProjectUpdate):
+    """Rename a project (and/or update its description)."""
+    fields = []
+    values = []
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Project name cannot be empty")
+        fields.append("name = ?")
+        values.append(name)
+    if body.description is not None:
+        fields.append("description = ?")
+        values.append(body.description)
+    if not fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT id FROM projects WHERE id = ?", (project_id,))
+        if not await cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Project not found")
+        await db.execute(
+            f"UPDATE projects SET {', '.join(fields)} WHERE id = ?",
+            (*values, project_id),
+        )
+        await db.commit()
+        cursor = await db.execute("""
+            SELECT p.*, COUNT(pr.recording_id) as recording_count
+            FROM projects p
+            LEFT JOIN project_recordings pr ON p.id = pr.project_id
+            WHERE p.id = ?
+            GROUP BY p.id
+        """, (project_id,))
         row = await cursor.fetchone()
     finally:
         await db.close()

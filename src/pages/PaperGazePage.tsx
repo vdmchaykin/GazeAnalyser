@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, ChevronRight, Pause, Play, RotateCcw } from "lucide-react";
+import { Activity, Pause, Play, RotateCcw } from "lucide-react";
 import { api } from "@/lib/api";
-import { formatDuration, formatDate } from "@/lib/utils";
 import { SurfacePositionsPanel } from "@/components/exports/SurfacePositionsPanel";
 import { AoiFixationsPanel } from "@/components/exports/AoiFixationsPanel";
 import { EventSeekbar } from "@/components/player/EventSeekbar";
-import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
+import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
 import type { RecordingMeta, RecordingEvent, GazePrediction } from "@/types";
 
 const PAPER_W = 794;
@@ -452,45 +451,14 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
 
   if (!recording) {
     return (
-      <div className="flex h-full">
-        <div className="w-80 border-r border-zinc-800 flex flex-col">
-          <div className="flex-1 overflow-auto">
-            {loadingRecs ? (
-              <p className="text-zinc-500 text-xs p-4">Loading…</p>
-            ) : recordings.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12 text-zinc-600">
-                <Activity className="w-8 h-8 mb-2 opacity-30" />
-                <p className="text-xs">No recordings yet</p>
-              </div>
-            ) : (
-              recordings.map(rec => (
-                <button
-                  key={rec.id}
-                  onClick={() => handleSelectRecording(rec)}
-                  className="w-full flex items-center gap-3 px-4 py-3 text-left
-                             border-b border-zinc-800/50 hover:bg-zinc-900 transition-colors
-                             cursor-pointer"
-                >
-                  <RecordingThumbnail recordingId={rec.id} />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-white truncate">{rec.name}</p>
-                    <p className="text-xs text-zinc-500">
-                      {rec.wearer_name} · {formatDuration(rec.duration_sec)} · {formatDate(rec.start_time)}
-                    </p>
-                  </div>
-                  <ChevronRight className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
-                </button>
-              ))
-            )}
-          </div>
-        </div>
-        <div className="flex-1 flex items-center justify-center text-zinc-600">
-          <div className="text-center">
-            <Activity className="w-10 h-10 mb-3 mx-auto opacity-20" />
-            <p className="text-sm">Select a recording to visualize gaze on paper</p>
-          </div>
-        </div>
-      </div>
+      <RecordingPickerScreen
+        recordings={recordings}
+        loading={loadingRecs}
+        onSelect={handleSelectRecording}
+        emptyIcon={Activity}
+        placeholderIcon={Activity}
+        placeholder="Select a recording to visualize gaze on paper"
+      />
     );
   }
 

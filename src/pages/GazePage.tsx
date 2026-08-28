@@ -1,14 +1,13 @@
 import { useEffect, useState } from "react";
-import { ScanEye, ChevronRight } from "lucide-react";
+import { ScanEye } from "lucide-react";
 import { api } from "@/lib/api";
-import { formatDuration, formatDate } from "@/lib/utils";
 import { GAZE_SOURCE_STEPS, type RecordingMeta, type GazeStep, type GazeAnalysisState, type GazeSource } from "@/types";
 import { GazeDetectStep } from "@/components/gaze/GazeDetectStep";
 import { GazeCalibrateStep } from "@/components/gaze/GazeCalibrateStep";
 import { GazeMapStep } from "@/components/gaze/GazeMapStep";
 import { GazeFixationStep } from "@/components/gaze/GazeFixationStep";
 import { GazeSourceSelector } from "@/components/gaze/GazeSourceSelector";
-import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
+import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
 import { tourAnchor, type AnchorId } from "@/lib/tour/anchors";
 import { isDemoRecording } from "@/lib/tour/demo";
 
@@ -127,43 +126,16 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
 
   if (!selected) {
     return (
-      <div className="flex h-full">
-        <div className="w-80 border-r border-zinc-800 flex flex-col" {...tourAnchor("gaze.recordingList")}>
-          <div className="flex-1 overflow-auto">
-            {loadingRecs ? (
-              <p className="text-zinc-500 text-xs p-4">Loading…</p>
-            ) : recordings.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12 text-zinc-600">
-                <ScanEye className="w-8 h-8 mb-2 opacity-30" />
-                <p className="text-xs">No recordings yet</p>
-              </div>
-            ) : (
-              recordings.map((rec) => (
-                <button
-                  key={rec.id}
-                  {...(isDemoRecording(rec) ? tourAnchor("gaze.demoRecording") : {})}
-                  onClick={() => handleSelectRecording(rec)}
-                  className="w-full flex items-center gap-3 px-4 py-3 text-left
-                             border-b border-zinc-800/50 hover:bg-zinc-900 transition-colors
-                             group cursor-pointer"
-                >
-                  <RecordingThumbnail recordingId={rec.id} />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-white truncate">{rec.name}</p>
-                    <p className="text-xs text-zinc-500">
-                      {rec.wearer_name} · {formatDuration(rec.duration_sec)} · {formatDate(rec.start_time)}
-                    </p>
-                  </div>
-                  <ChevronRight className="w-3.5 h-3.5 text-zinc-600" />
-                </button>
-              ))
-            )}
-          </div>
-        </div>
-        <div className="flex-1 flex items-center justify-center text-zinc-600">
-          <p className="text-sm">Select a recording to start gaze analysis</p>
-        </div>
-      </div>
+      <RecordingPickerScreen
+        recordings={recordings}
+        loading={loadingRecs}
+        onSelect={handleSelectRecording}
+        containerProps={tourAnchor("gaze.recordingList")}
+        rowProps={(rec) => (isDemoRecording(rec) ? tourAnchor("gaze.demoRecording") : undefined)}
+        autoExpand={isDemoRecording}
+        emptyIcon={ScanEye}
+        placeholder="Select a recording to start gaze analysis"
+      />
     );
   }
 

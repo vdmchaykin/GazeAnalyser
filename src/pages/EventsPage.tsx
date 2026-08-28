@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
-  CalendarClock, ChevronRight, ChevronDown, Play, Pause, Volume2, VolumeX,
+  CalendarClock, ChevronDown, Play, Pause, Volume2, VolumeX,
   Pencil, Trash2, Check, X, ScanEye,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { formatDuration, formatDate } from "@/lib/utils";
 import { EventSeekbar, formatTs } from "@/components/player/EventSeekbar";
-import { RecordingThumbnail } from "@/components/player/RecordingThumbnail";
+import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
 import type { RecordingMeta, RecordingEvent } from "@/types";
 
 const API = "http://localhost:8765";
@@ -66,57 +65,6 @@ function formatTime(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-// ─── Recording selector ───────────────────────────────────────────────────────
-
-function RecordingSelector({
-  recordings,
-  loading,
-  onSelect,
-}: {
-  recordings: RecordingMeta[];
-  loading: boolean;
-  onSelect: (rec: RecordingMeta) => void;
-}) {
-  return (
-    <div className="flex h-full">
-      <div className="w-80 border-r border-zinc-800 flex flex-col">
-        <div className="flex-1 overflow-auto">
-          {loading ? (
-            <p className="text-zinc-500 text-xs p-4">Loading…</p>
-          ) : recordings.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-zinc-600">
-              <CalendarClock className="w-8 h-8 mb-2 opacity-30" />
-              <p className="text-xs">No recordings yet</p>
-            </div>
-          ) : (
-            recordings.map((rec) => (
-              <button
-                key={rec.id}
-                onClick={() => onSelect(rec)}
-                className="w-full flex items-center gap-3 px-4 py-3 text-left
-                           border-b border-zinc-800/50 hover:bg-zinc-900 transition-colors
-                           cursor-pointer"
-              >
-                <RecordingThumbnail recordingId={rec.id} />
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm text-white truncate">{rec.name}</p>
-                  <p className="text-xs text-zinc-500">
-                    {rec.wearer_name} · {formatDuration(rec.duration_sec)} · {formatDate(rec.start_time)}
-                  </p>
-                </div>
-                <ChevronRight className="w-3.5 h-3.5 text-zinc-600" />
-              </button>
-            ))
-          )}
-        </div>
-      </div>
-      <div className="flex-1 flex items-center justify-center text-zinc-600">
-        <p className="text-sm">Select a recording to start event marking</p>
-      </div>
-    </div>
-  );
 }
 
 // ─── Inline video player ──────────────────────────────────────────────────────
@@ -599,10 +547,12 @@ export function EventsPage({ initialRecording }: { initialRecording?: RecordingM
 
   if (!selected) {
     return (
-      <RecordingSelector
+      <RecordingPickerScreen
         recordings={recordings}
         loading={loadingRecs}
         onSelect={handleSelect}
+        emptyIcon={CalendarClock}
+        placeholder="Select a recording to start event marking"
       />
     );
   }

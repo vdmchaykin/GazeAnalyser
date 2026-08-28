@@ -26,6 +26,7 @@ app.include_router(projects.router)
 app.include_router(gaze.router)
 app.include_router(events.router)
 app.include_router(aoi.router)
+app.include_router(aoi.project_router)
 app.include_router(export.router)
 app.include_router(motion.router)
 

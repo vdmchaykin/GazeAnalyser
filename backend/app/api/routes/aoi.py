@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.database import get_db
+from app.services.recording_service import RECORDINGS_DIR
 
 try:
     import pupil_apriltags as apriltag
@@ -27,6 +28,8 @@ router = APIRouter(prefix="/api/recordings/{recording_id}/aoi", tags=["aoi"])
 OUTPUT_W, OUTPUT_H = 794, 1123
 
 _SEGMENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# Project ids are uuid4 strings; the pattern is a path-traversal guard.
+_PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 # ─── Scene camera intrinsics (lens distortion) ────────────────────────────────
@@ -128,14 +131,54 @@ def _tags_from_detections(folder_path: Optional[str], detections) -> List["TagIn
 
 
 async def _get_recording(recording_id: str) -> dict:
+    """The recording row, plus the project whose shared AoI applies to it.
+
+    The schema allows several memberships, but the workflow assumes one paper per
+    project and one project per recording, so the first membership is the one that
+    counts. Carrying it on the row lets every sync helper below resolve the shared
+    annotation without a database round-trip of its own."""
     db = await get_db()
     try:
         cur = await db.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,))
         row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        cur = await db.execute(
+            "SELECT project_id FROM project_recordings WHERE recording_id = ? "
+            "ORDER BY rowid LIMIT 1",
+            (recording_id,),
+        )
+        member = await cur.fetchone()
+    finally:
+        await db.close()
+    rec = dict(row)
+    rec["project_id"] = member["project_id"] if member else None
+    return rec
+
+
+async def _project_recordings(project_id: str) -> List[dict]:
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "SELECT r.* FROM recordings r JOIN project_recordings pr ON r.id = pr.recording_id "
+            "WHERE pr.project_id = ?",
+            (project_id,),
+        )
+        rows = await cur.fetchall()
+    finally:
+        await db.close()
+    return [dict(r) for r in rows]
+
+
+async def _require_project(project_id: str) -> dict:
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
+        row = await cur.fetchone()
     finally:
         await db.close()
     if not row:
-        raise HTTPException(status_code=404, detail="Recording not found")
+        raise HTTPException(status_code=404, detail="Project not found")
     return dict(row)
 
 
@@ -143,6 +186,38 @@ def _aoi_dir(folder_path: str) -> Path:
     d = Path(folder_path) / "aoi"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# ── project-level AoI ──────────────────────────────────────────────────────
+# Every recording in a project looks at the same printed page, so the annotation
+# describes the PROJECT, not each recording: the areas (already in normalized page
+# coordinates), the warped background, and the marker registry are all properties
+# of the paper. What stays with a recording is only what its own video produced —
+# the reference frame, surface_positions.csv, the gaze projections.
+#
+# A recording may still hold a state file of its own, and that OVERRIDES the
+# project's — which is what a session shot with a different printout needs. States
+# written before projects existed are exactly such overrides, so they keep working
+# untouched until the user drops them.
+
+PROJECTS_DIR = RECORDINGS_DIR.parent / "projects"
+
+
+def _project_aoi_dir(project_id: str) -> Path:
+    if not _PROJECT_ID_RE.match(project_id):
+        raise HTTPException(status_code=400, detail="Invalid project id")
+    d = PROJECTS_DIR / project_id / "aoi"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _aoi_dirs(rec: dict) -> List[Path]:
+    """Where this recording's AoI state is looked up, in precedence order."""
+    dirs = [_aoi_dir(rec["folder_path"])]
+    pid = rec.get("project_id")
+    if pid:
+        dirs.append(_project_aoi_dir(pid))
+    return dirs
 
 
 # ── gaze source ────────────────────────────────────────────────────────────
@@ -276,6 +351,10 @@ class AoiStateBody(BaseModel):
     using_reference: bool = False                    # whether the reference image is active
     tag_count: Optional[int] = None
     selected_tags: Optional[List[TagInfo]] = None    # tags defining the surface (for surface_positions.csv)
+    # {tag_id: [[u,v]×4]} in normalized page coords, derived from selected_tags at
+    # save time. Stored because a shared annotation is used by recordings whose
+    # frames never saw these tags — see _build_registry.
+    markers: Optional[dict] = None
 
 
 class CustomSegment(BaseModel):
@@ -419,12 +498,18 @@ async def save_state(recording_id: str, body: AoiStateBody):
 
 @router.get("/segments")
 async def get_segments(recording_id: str):
+    """Custom (non-event) segments this recording shows — its own plus its project's."""
     rec = await _get_recording(recording_id)
-    adir = _aoi_dir(rec["folder_path"])
-    path = adir / "segments.json"
-    if not path.exists():
-        return {"custom_segments": []}
-    return json.loads(path.read_text())
+    seen, merged = set(), []
+    for d in _aoi_dirs(rec):
+        path = d / "segments.json"
+        if not path.exists():
+            continue
+        for seg in json.loads(path.read_text()).get("custom_segments", []):
+            if seg.get("id") not in seen:
+                seen.add(seg.get("id"))
+                merged.append(seg)
+    return {"custom_segments": merged}
 
 
 @router.post("/segments")
@@ -437,33 +522,264 @@ async def save_segments(recording_id: str, body: SegmentsManifest):
 
 # ─── Per-segment state endpoints ─────────────────────────────────────────────
 
-@router.get("/{segment_id}/state")
-async def get_segment_state(recording_id: str, segment_id: str):
+def _check_segment_id(segment_id: str) -> str:
     if not _SEGMENT_ID_RE.match(segment_id):
         raise HTTPException(status_code=400, detail="Invalid segment id")
+    return segment_id
+
+
+EMPTY_STATE = {
+    "areas": [], "reference_timestamp_s": None, "warped_image_b64": None, "tag_count": None,
+}
+
+
+def _state_markers(rec: dict, body: AoiStateBody, previous: dict) -> Optional[dict]:
+    """The registry to store with a state being saved, given the recording whose
+    frame the tags were detected in.
+
+    A registry the client carried over from the state it loaded WINS over deriving
+    one here. That state's tags may have been detected in another recording's frame
+    — a recording overriding its project's annotation is exactly that case — and
+    re-deriving them against this recording's frame size and lens calibration would
+    deform the page. The editor clears `markers` whenever it picks tags anew, which
+    is precisely when a fresh derivation is the right answer.
+
+    Failing both, the registry already on disk is kept: an area-only save carries no
+    tags and must not drop the surface definition."""
+    if body.markers:
+        return body.markers
+    tags = list(body.selected_tags or [])
+    scene_video = rec.get("scene_video")
+    if len(tags) >= 3 and scene_video and Path(scene_video).exists():
+        cap = cv2.VideoCapture(scene_video)
+        try:
+            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        finally:
+            cap.release()
+        registry = _build_surface_registry(tags, frame_w, frame_h, rec["folder_path"])
+        if registry:
+            return registry
+    return previous.get("markers")
+
+
+@router.get("/{segment_id}/state")
+async def get_segment_state(recording_id: str, segment_id: str):
+    """The AoI state in force for this recording: its own override, else its
+    project's shared annotation. ``scope`` says which one came back."""
+    _check_segment_id(segment_id)
     rec = await _get_recording(recording_id)
-    adir = _aoi_dir(rec["folder_path"])
-    path = adir / f"{segment_id}.json"
-    if not path.exists():
-        # Migration: for "general" segment, fall back to legacy state.json
-        if segment_id == "general":
-            legacy = adir / "state.json"
-            if legacy.exists():
-                return json.loads(legacy.read_text())
-        return {"areas": [], "reference_timestamp_s": None, "warped_image_b64": None, "tag_count": None}
-    return json.loads(path.read_text())
+    state, scope = _resolve_state_scope(rec, segment_id)
+    return {**(state or EMPTY_STATE), "scope": scope, "project_id": rec.get("project_id")}
 
 
 @router.post("/{segment_id}/state")
 async def save_segment_state(recording_id: str, segment_id: str, body: AoiStateBody):
-    if not _SEGMENT_ID_RE.match(segment_id):
-        raise HTTPException(status_code=400, detail="Invalid segment id")
+    """Annotate this recording alone, overriding whatever its project defines."""
+    _check_segment_id(segment_id)
     rec = await _get_recording(recording_id)
     adir = _aoi_dir(rec["folder_path"])
-    (adir / f"{segment_id}.json").write_text(json.dumps(body.model_dump()))
+    # Resolved, not just this recording's own: overriding an annotation inherited
+    # from the project keeps that annotation's registry unless new tags were picked.
+    previous, _ = _resolve_state_scope(rec, segment_id)
+    state = {**body.model_dump(), "markers": _state_markers(rec, body, previous)}
+    (adir / f"{segment_id}.json").write_text(json.dumps(state))
     _invalidate_surface(adir)
     _invalidate_aoi_metrics(adir)
+    return {"ok": True, "scope": "recording"}
+
+
+@router.delete("/{segment_id}/state")
+async def clear_segment_state(recording_id: str, segment_id: str):
+    """Drop this recording's override so it follows its project's annotation again."""
+    _check_segment_id(segment_id)
+    rec = await _get_recording(recording_id)
+    adir = _aoi_dir(rec["folder_path"])
+    removed = False
+    for name in (f"{segment_id}.json", "state.json" if segment_id == "general" else None):
+        if name and (adir / name).exists():
+            (adir / name).unlink()
+            removed = True
+    if removed:
+        _invalidate_surface(adir)
+        _invalidate_aoi_metrics(adir)
+    _, scope = _resolve_state_scope(rec, segment_id)
+    return {"removed": removed, "scope": scope}
+
+
+# ─── Project-level AoI ───────────────────────────────────────────────────────
+# The annotation the whole project shares. Recordings read it through
+# _resolve_state_scope; anything a recording saves for itself wins over it.
+
+project_router = APIRouter(prefix="/api/projects/{project_id}/aoi", tags=["aoi"])
+
+
+class ProjectAoiStateBody(AoiStateBody):
+    # Which recording's frame the tags and the background came from. Needed to turn
+    # `selected_tags` (in that recording's scene pixels, with that recording's lens
+    # distortion) into the page-normalized registry every other recording will use.
+    source_recording_id: Optional[str] = None
+
+
+async def _invalidate_project_recordings(
+    project_id: str, segment_id: str, except_ids: Optional[List[str]] = None,
+) -> List[str]:
+    """Drop derived files of every recording the changed shared segment reaches.
+
+    A recording that annotates this segment itself is untouched — its surface and
+    metrics were built from its own state and are still valid. Regenerating
+    surface_positions.csv costs a full video pass, so it is only thrown away for
+    recordings the change actually applies to."""
+    affected = []
+    for rec in await _project_recordings(project_id):
+        if except_ids and rec["id"] in except_ids:
+            continue
+        adir = _aoi_dir(rec["folder_path"])
+        if _has_override(adir, segment_id):
+            continue
+        _invalidate_surface(adir)
+        _invalidate_aoi_metrics(adir)
+        affected.append(rec["id"])
+    return affected
+
+
+@project_router.get("/segments")
+async def get_project_segments(project_id: str):
+    await _require_project(project_id)
+    pdir = _project_aoi_dir(project_id)
+    path = pdir / "segments.json"
+    manifest = json.loads(path.read_text()) if path.exists() else {"custom_segments": []}
+    return {**manifest, "annotated": _list_aoi_segments(pdir)}
+
+
+@project_router.post("/segments")
+async def save_project_segments(project_id: str, body: SegmentsManifest):
+    await _require_project(project_id)
+    (_project_aoi_dir(project_id) / "segments.json").write_text(json.dumps(body.model_dump()))
     return {"ok": True}
+
+
+@project_router.get("/overrides")
+async def get_project_overrides(project_id: str):
+    """Which recordings annotate segments themselves instead of following the project.
+
+    The AoI editor shows these so a recording that silently ignores the shared
+    annotation is visible, and can be put back on it."""
+    await _require_project(project_id)
+    pdir = _project_aoi_dir(project_id)
+    segments = _list_aoi_segments(pdir)
+    out = []
+    for rec in await _project_recordings(project_id):
+        adir = _aoi_dir(rec["folder_path"])
+        own = _list_aoi_segments(adir)
+        if own:
+            out.append({
+                "recording_id": rec["id"],
+                "name": rec.get("name"),
+                "wearer_name": rec.get("wearer_name"),
+                "segments": own,
+                # Segments where the override actually shadows a shared annotation.
+                "shadowing": [sid for sid in own if sid in segments],
+            })
+    return {"project_segments": segments, "overrides": out}
+
+
+@project_router.get("/{segment_id}/state")
+async def get_project_state(project_id: str, segment_id: str):
+    _check_segment_id(segment_id)
+    await _require_project(project_id)
+    state = _load_segment_state(_project_aoi_dir(project_id), segment_id)
+    return {**(state or EMPTY_STATE), "scope": "project" if state else "none"}
+
+
+@project_router.post("/{segment_id}/state")
+async def save_project_state(project_id: str, segment_id: str, body: ProjectAoiStateBody):
+    """Annotate the segment once for every recording in the project."""
+    _check_segment_id(segment_id)
+    await _require_project(project_id)
+    pdir = _project_aoi_dir(project_id)
+    previous = _load_segment_state(pdir, segment_id)
+
+    source = await _get_recording(body.source_recording_id) if body.source_recording_id else None
+    markers = _state_markers(source, body, previous) if source else (
+        body.markers or previous.get("markers"))
+    if body.selected_tags and not markers:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not derive the surface from those tags. Re-detect them on a "
+                   "frame where at least 3 markers are visible.",
+        )
+
+    state = {
+        **body.model_dump(exclude={"source_recording_id"}),
+        "markers": markers,
+        "source_recording_id": body.source_recording_id or previous.get("source_recording_id"),
+    }
+    (pdir / f"{segment_id}.json").write_text(json.dumps(state))
+    affected = await _invalidate_project_recordings(project_id, segment_id)
+    return {"ok": True, "scope": "project", "invalidated": affected}
+
+
+@project_router.delete("/{segment_id}/state")
+async def clear_project_state(project_id: str, segment_id: str):
+    _check_segment_id(segment_id)
+    await _require_project(project_id)
+    path = _project_aoi_dir(project_id) / f"{segment_id}.json"
+    removed = path.exists()
+    if removed:
+        path.unlink()
+        await _invalidate_project_recordings(project_id, segment_id)
+    return {"removed": removed}
+
+
+class SeedProjectRequest(BaseModel):
+    recording_id: str
+    segment_ids: Optional[List[str]] = None   # default: everything that recording has
+    clear_source_override: bool = False
+
+
+@project_router.post("/seed")
+async def seed_project_from_recording(project_id: str, body: SeedProjectRequest):
+    """Promote one recording's existing annotation to the whole project.
+
+    The migration path for work done before the annotation was shared: the states
+    already carry page-normalized areas, and their registry is derived here from the
+    tags with that recording's own frame and calibration — exactly as it was drawn."""
+    await _require_project(project_id)
+    rec = await _get_recording(body.recording_id)
+    adir = _aoi_dir(rec["folder_path"])
+    pdir = _project_aoi_dir(project_id)
+
+    seeded, skipped = [], []
+    for sid in (body.segment_ids or _list_aoi_segments(adir)):
+        _check_segment_id(sid)
+        state = _load_segment_state(adir, sid)
+        if not state:
+            continue
+        markers = state.get("markers")
+        if not markers:
+            tags = state.get("selected_tags") or []
+            if len(tags) >= 3:
+                markers = _state_markers(
+                    rec, AoiStateBody(selected_tags=[TagInfo(**t) for t in tags]), {},
+                )
+        if not markers:
+            # Without a registry the shared state cannot be localized in any other
+            # recording, so it is left behind rather than published half-working.
+            skipped.append(sid)
+            continue
+        (pdir / f"{sid}.json").write_text(json.dumps({
+            **state, "markers": markers, "source_recording_id": body.recording_id,
+        }))
+        seeded.append(sid)
+        if body.clear_source_override:
+            (adir / f"{sid}.json").unlink(missing_ok=True)
+            if sid == "general":
+                (adir / "state.json").unlink(missing_ok=True)
+
+    for sid in seeded:
+        await _invalidate_project_recordings(project_id, sid, except_ids=[body.recording_id])
+    return {"seeded": seeded, "skipped": skipped}
 
 
 # ─── Warp from manually selected tags ────────────────────────────────────────
@@ -801,7 +1117,10 @@ def _run_surface_positions(
 
 
 def _load_segment_state(adir: Path, segment_id: str) -> dict:
-    """Read a segment's saved AoI state, falling back to legacy state.json."""
+    """Read a segment's saved AoI state from ONE directory (no resolution).
+
+    Falls back to the legacy state.json, which held "general" before per-segment
+    files existed."""
     path = adir / f"{segment_id}.json"
     if path.exists():
         return json.loads(path.read_text())
@@ -810,6 +1129,35 @@ def _load_segment_state(adir: Path, segment_id: str) -> dict:
         if legacy.exists():
             return json.loads(legacy.read_text())
     return {}
+
+
+def _has_override(adir: Path, segment_id: str) -> bool:
+    """Does this recording annotate the segment itself, rather than via its project?"""
+    return (adir / f"{segment_id}.json").exists() or (
+        segment_id == "general" and (adir / "state.json").exists()
+    )
+
+
+def _resolve_state_scope(rec: dict, segment_id: str) -> tuple:
+    """``(state, scope)`` — the AoI state that applies to this recording.
+
+    ``scope`` is "recording" for the recording's own override, "project" for the
+    shared annotation, "none" when the segment is not annotated anywhere. Callers
+    that must not re-derive geometry from another recording's frame check it."""
+    adir = _aoi_dir(rec["folder_path"])
+    own = _load_segment_state(adir, segment_id)
+    if own:
+        return own, "recording"
+    pid = rec.get("project_id")
+    if pid:
+        shared = _load_segment_state(_project_aoi_dir(pid), segment_id)
+        if shared:
+            return shared, "project"
+    return {}, "none"
+
+
+def _resolve_state(rec: dict, segment_id: str) -> dict:
+    return _resolve_state_scope(rec, segment_id)[0]
 
 
 class TagDetector:
@@ -897,18 +1245,35 @@ def _scene_to_paper_H(detections, registry: dict,
         return None
 
 
-def _build_registry_from_state(adir: Path, segment_id: str, scene_video: str) -> Optional[dict]:
-    """Build a surface marker registry for one segment.
+def _build_registry(rec: dict, segment_id: str, scene_video: str) -> Optional[dict]:
+    """Surface marker registry ``{tag_id: [[u,v]×4]}`` in normalized page coords.
 
-    Uses the segment's saved ``selected_tags``; for legacy states without them,
-    re-detects AprilTags on the stored reference frame. Returns ``{tag_id: [[u,v]×4]}``
-    (normalized paper coords) or None if no surface can be established.
+    A state saved on this recording is re-derived from its ``selected_tags``, and
+    for legacy states without them by re-detecting AprilTags on the stored
+    reference frame. Returns None if no surface can be established.
+
+    A SHARED (project) state instead ships the registry it was built with, and
+    that one is used as-is: its tags were detected in another recording's frame,
+    so re-deriving them here would apply this recording's frame size and lens
+    calibration to those pixel coordinates and silently deform the page.
 
     The saved tags always come from a SCENE FRAME (an uploaded reference image only
     replaces the background picture, never the tag selection), so their lens
     distortion is always corrected here."""
-    folder_path = str(adir.parent)
-    state = _load_segment_state(adir, segment_id)
+    state, scope = _resolve_state_scope(rec, segment_id)
+    if scope == "none":
+        return None
+
+    markers = state.get("markers")
+    if markers:
+        return {int(k): v for k, v in markers.items()}
+    if scope == "project":
+        # Saved before registries were stored — the annotation has to be re-saved
+        # from its source recording before it can be used anywhere else.
+        return None
+
+    adir = _aoi_dir(rec["folder_path"])
+    folder_path = rec["folder_path"]
     raw_tags = state.get("selected_tags")
 
     cap = cv2.VideoCapture(scene_video)
@@ -940,24 +1305,16 @@ def _build_registry_from_state(adir: Path, segment_id: str, scene_video: str) ->
     return _build_surface_registry(selected_tags, frame_w, frame_h, folder_path)
 
 
-def _build_recording_registry(adir: Path, scene_video: str) -> Optional[dict]:
+def _build_recording_registry(rec: dict, scene_video: str) -> Optional[dict]:
     """Registry for the recording's physical surface (shared across segments).
 
     Every segment is drawn on the same paper, so any segment's tags define the same
     normalized plane. Prefers ``general`` (covers legacy state.json), then scans the
-    other segment states."""
+    other segments the recording resolves — its own first, then its project's."""
     if not _APRILTAG_AVAILABLE:
         return None
-    tried = {"general"}
-    reg = _build_registry_from_state(adir, "general", scene_video)
-    if reg:
-        return reg
-    for p in sorted(adir.glob("*.json")):
-        sid = p.stem
-        if sid in tried or sid in ("surface", "state") or not _SEGMENT_ID_RE.match(sid):
-            continue
-        tried.add(sid)
-        reg = _build_registry_from_state(adir, sid, scene_video)
+    for sid in _resolve_segments(rec):
+        reg = _build_registry(rec, sid, scene_video)
         if reg:
             return reg
     return None
@@ -976,7 +1333,7 @@ async def start_surface_positions(recording_id: str, segment_id: str = "general"
         raise HTTPException(status_code=404, detail="Scene video not found")
 
     adir = _aoi_dir(rec["folder_path"])
-    registry = _build_registry_from_state(adir, segment_id, scene_video)
+    registry = _build_registry(rec, segment_id, scene_video)
     if registry is None:
         raise HTTPException(
             status_code=400,
@@ -1116,7 +1473,7 @@ def _invalidate_aoi_metrics(adir: Path) -> None:
 
 
 def _list_aoi_segments(adir: Path) -> List[str]:
-    """Every segment id that has saved AoI state, in stable order.
+    """Every segment id with saved AoI state in ONE directory, in stable order.
 
     A segment only has shapes once its state file exists, so the directory is the
     authoritative list — no need to re-derive segments from events here."""
@@ -1130,11 +1487,25 @@ def _list_aoi_segments(adir: Path) -> List[str]:
     return ids
 
 
-def _segment_areas(adir: Path) -> List[tuple]:
+def _resolve_segments(rec: dict) -> List[str]:
+    """Every segment this recording resolves — its own overrides plus its project's.
+
+    "general" leads, so the callers that only need any one surface (the marker
+    registry) hit the segment that is always present first."""
+    ids: List[str] = []
+    for d in _aoi_dirs(rec):
+        for sid in _list_aoi_segments(d):
+            if sid not in ids:
+                ids.append(sid)
+    ids.sort(key=lambda sid: (sid != "general", sid))
+    return ids
+
+
+def _segment_areas(rec: dict) -> List[tuple]:
     """(segment_id, areas) for every segment that actually has drawn shapes."""
     out = []
-    for sid in _list_aoi_segments(adir):
-        areas = [a for a in _load_segment_state(adir, sid).get("areas", []) if a.get("shape")]
+    for sid in _resolve_segments(rec):
+        areas = [a for a in _resolve_state(rec, sid).get("areas", []) if a.get("shape")]
         if areas:
             out.append((sid, areas))
     return out
@@ -1198,7 +1569,7 @@ async def generate_aoi_metrics(recording_id: str, source: Optional[str] = None):
             detail="No fixations yet. Run fixation detection in the Gaze section first.",
         )
 
-    segments = _segment_areas(adir)
+    segments = _segment_areas(rec)
     if not segments:
         raise HTTPException(
             status_code=400,
@@ -1271,7 +1642,7 @@ async def aoi_metrics_status(recording_id: str, source: Optional[str] = None):
     adir = _aoi_dir(rec["folder_path"])
     src = active_source(rec["folder_path"], source)
     gdir = _gaze_dir(rec["folder_path"], src)
-    segments = _segment_areas(adir)
+    segments = _segment_areas(rec)
     return {
         "source": src,
         "has_fixations": (gdir / "fixations_on_surface.csv").exists(),
