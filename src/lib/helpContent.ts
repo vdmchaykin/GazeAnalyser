@@ -112,15 +112,23 @@ export const HELP_CONTENT: Record<string, PageHelp> = {
   surface: {
     title: "Surface Map",
     intro:
-      "Visualise accumulated gaze on the stimulus. Requires gaze mapping to have been completed first.",
+      "Watch gaze on the scene video and on the flattened stimulus side by side. Requires gaze mapping to have been completed first.",
     sections: [
       {
-        heading: "Choose a segment",
-        body: "Use the segment tabs (General, TMT-A, TMT-B and any custom segments from Events) to restrict the gaze shown to that interval.",
+        heading: "Two views, one clock",
+        body: "The scene video on the left plays the recording; the page on the right is the same moment warped flat. The gaze cursor — a red ring around a blue one — marks where the wearer looked, and appears on the paper only while the gaze is on it.",
       },
       {
-        heading: "Play back",
-        body: "Use the slider and play controls to watch gaze accumulate over time. Reset returns to the start.",
+        heading: "Overlay toggles",
+        body: "Surface draws the AprilTag-localized page outline (its red edge is the top of the page), Markers outlines the tags seen in that frame, Gaze shows the cursor on the video, and Eye shows the eye camera picture-in-picture — drag it anywhere over the video.",
+      },
+      {
+        heading: "Choose a segment",
+        body: "Use the segment tabs (General, TMT-A, TMT-B and any custom segments from Events) to switch which annotated page is shown. Tabs also follow the playhead as it crosses each segment's start.",
+      },
+      {
+        heading: "No outline on the video?",
+        body: "The outline and marker boxes come from surface_positions.csv — generate it in the Exports panel on the right.",
       },
       {
         heading: "No data?",

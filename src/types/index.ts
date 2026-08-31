@@ -1,3 +1,5 @@
+import type { SceneIntrinsics } from "@/lib/lensDistortion";
+
 export type Page = "projects" | "gaze" | "player" | "export" | "events" | "aoi" | "surface" | "visualisation";
 
 /** Pages that can be opened for a specific recording. */
@@ -138,6 +140,12 @@ export interface FixationResult {
 export interface SurfacePositionsData {
   ts_ns: (number | null)[];
   corners: (number[] | null)[];
+  /** Registered tag ids visible in each frame — absent in files served by an older backend. */
+  markers?: number[][];
+  /** Tag id → its 4 corners `[u,v]` in normalized surface coordinates. */
+  registry?: Record<string, [number, number][]>;
+  /** Scene-camera intrinsics, needed to reproject the registry accurately (null: none on file). */
+  intrinsics?: SceneIntrinsics | null;
   frames: number;
   localized: number;
 }

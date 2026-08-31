@@ -1396,7 +1396,11 @@ async def surface_positions_data(recording_id: str):
     """Per-frame surface corners for the player overlay.
 
     ``corners[i]`` is ``[tl_x, tl_y, tr_x, tr_y, br_x, br_y, bl_x, bl_y]`` in scene
-    pixels, or null where the surface was not localizable in that frame. Together
+    pixels, or null where the surface was not localizable in that frame.
+    ``markers[i]`` lists the registered tag ids actually seen in that frame, and
+    ``registry`` maps each registered tag id to its 4 corners in normalized surface
+    coordinates — together they let an overlay outline the markers that carried the
+    localization, without re-detecting anything. Together
     with a fixation's normalized surface position this pins the fixation to the
     paper exactly, with no drift — the same homography the AoI export is built on,
     just evaluated in the direction normalized → scene."""
@@ -1407,17 +1411,48 @@ async def surface_positions_data(recording_id: str):
 
     ts_ns: list = []
     corners: list = []
+    markers: list = []
     localized = 0
     corner_cols = _SURFACE_COLS[3:]
     with open(path) as f:
         for row in csv.DictReader(f):
             ts_ns.append(int(row["timestamp [ns]"]) if row["timestamp [ns]"] else None)
+            seen = row.get("detected markers") or ""
+            markers.append([int(m) for m in seen.split(";") if m])
             if row[corner_cols[0]] == "":
                 corners.append(None)
                 continue
             corners.append([float(row[c]) for c in corner_cols])
             localized += 1
-    return {"ts_ns": ts_ns, "corners": corners, "frames": len(corners), "localized": localized}
+    # The registry the CSV was actually produced with, so an overlay can outline
+    # each marker exactly where the localization believed it to be. Read from
+    # surface.json rather than the segment state: a state saved before the tags
+    # were registered carries no `markers` of its own.
+    registry: dict = {}
+    surface_json = _aoi_dir(rec["folder_path"]) / "surface.json"
+    if surface_json.exists():
+        try:
+            registry = json.loads(surface_json.read_text()).get("markers") or {}
+        except (OSError, ValueError):
+            registry = {}
+
+    # Scene-camera intrinsics, so a client can repeat the backend's own geometry:
+    # the corners above are RAW sensor pixels, and a homography fitted straight to
+    # them cannot express lens distortion — reprojecting the markers through such a
+    # fit lands them up to ~20 px off near the page corners. Undistorting first,
+    # fitting there and distorting the result back keeps it sub-pixel.
+    kd = scene_intrinsics(rec["folder_path"])
+    intrinsics = None
+    if kd is not None:
+        K, D = kd
+        d = [float(v) for v in np.ravel(D)[:8]]
+        d += [0.0] * (8 - len(d))
+        intrinsics = {"fx": float(K[0, 0]), "fy": float(K[1, 1]),
+                      "cx": float(K[0, 2]), "cy": float(K[1, 2]), "d": d}
+
+    return {"ts_ns": ts_ns, "corners": corners, "markers": markers,
+            "registry": registry, "intrinsics": intrinsics,
+            "frames": len(corners), "localized": localized}
 
 
 @router.get("/surface-positions/file")
