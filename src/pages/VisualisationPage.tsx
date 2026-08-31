@@ -3,6 +3,8 @@ import { ChartScatter, Download, Flame, Grid3x3, Loader2, Route } from "lucide-r
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
 import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
+import { tourAnchor } from "@/lib/tour/anchors";
+import { isDemoRecording } from "@/lib/tour/demo";
 import { GazeSourceBadge } from "@/components/gaze/GazeSourceBadge";
 import { GazeOffsetPanel, type PaperPreview } from "@/components/gaze/GazeOffsetPanel";
 import type { RecordingMeta, RecordingEvent, GazePrediction, Fixation } from "@/types";
@@ -294,7 +296,7 @@ function Colorbar({ mode, metric, max }: { mode: Mode; metric: AoiMetric; max: n
   const top = mode === "heatmap" ? "100" : String(Math.round(max));
   const mid = mode === "heatmap" ? "50" : String(Math.round(max / 2));
   return (
-    <div className="flex flex-col items-center gap-2 shrink-0 pl-1">
+    <div className="flex flex-col items-center gap-2 shrink-0 pl-1" {...tourAnchor("vis.colorbar")}>
       <span className="text-[10px] text-zinc-400 tabular-nums">{top}{unit}</span>
       <div className="relative flex-1 w-3 rounded" style={{ background: PALETTE_CSS, minHeight: 120 }}>
         <span className="absolute left-4 top-1/2 -translate-y-1/2 text-[10px] text-zinc-500 tabular-nums whitespace-nowrap">
@@ -521,6 +523,9 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
         recordings={recordings}
         loading={loadingRecs}
         onSelect={handleSelectRecording}
+        containerProps={tourAnchor("vis.recordingList")}
+        rowProps={(rec) => (isDemoRecording(rec) ? tourAnchor("vis.demoRecording") : undefined)}
+        autoExpand={isDemoRecording}
         emptyIcon={ChartScatter}
         placeholderIcon={ChartScatter}
         placeholder="Select a recording to visualize gaze"
@@ -557,7 +562,8 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
 
       {/* Mode switch + mode controls */}
       <div className="flex items-center gap-2 px-4 py-2 border-b border-zinc-800 shrink-0 bg-zinc-950">
-        <div className="flex items-center gap-1 bg-zinc-900 rounded-lg p-0.5">
+        <div className="flex items-center gap-1 bg-zinc-900 rounded-lg p-0.5"
+             {...tourAnchor("vis.modeSwitch")}>
           {MODES.map(({ id, label, Icon }) => (
             <button
               key={id}
@@ -572,6 +578,7 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
         </div>
 
         <div className="ml-auto flex items-center gap-3">
+          <span className="flex items-center" {...tourAnchor("vis.modeOptions")}>
           {mode === "heatmap" && (
             <label className="flex items-center gap-2 text-[11px] text-zinc-400">
               Radius
@@ -597,14 +604,18 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
               ))}
             </div>
           )}
+          </span>
 
-          <GazeOffsetPanel
-            recordingId={recording.id}
-            onPreview={setPreview}
-            onApplied={reloadGaze}
-          />
+          <div {...tourAnchor("vis.offsetPanel")}>
+            <GazeOffsetPanel
+              recordingId={recording.id}
+              onPreview={setPreview}
+              onApplied={reloadGaze}
+            />
+          </div>
 
           <button
+            {...tourAnchor("vis.download")}
             onClick={downloadPng}
             disabled={saving || loading || !!emptyMsg}
             title="Download as PNG"
@@ -620,7 +631,8 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
 
       {/* Segment tabs */}
       {segments.length > 0 && (
-        <div className="flex items-center border-b border-zinc-800 px-2 shrink-0 bg-zinc-950 overflow-x-auto">
+        <div className="flex items-center border-b border-zinc-800 px-2 shrink-0 bg-zinc-950 overflow-x-auto"
+             {...tourAnchor("vis.segmentTabs")}>
           {segments.map(seg => (
             <button
               key={seg.id}
@@ -646,6 +658,7 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
             <div
               className="relative border border-zinc-700 rounded shadow-2xl"
               style={{ aspectRatio: `${PAPER_W}/${PAPER_H}`, maxHeight: "100%", maxWidth: "100%", height: "100%" }}
+              {...tourAnchor("vis.canvas")}
             >
               <canvas
                 ref={setCanvas}
@@ -667,7 +680,8 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
       </div>
 
       {/* Footer counts */}
-      <div className="shrink-0 border-t border-zinc-800 bg-zinc-900 px-4 py-1.5 text-[11px] text-zinc-500 flex items-center gap-4">
+      <div className="shrink-0 border-t border-zinc-800 bg-zinc-900 px-4 py-1.5 text-[11px] text-zinc-500 flex items-center gap-4"
+           {...tourAnchor("vis.footer")}>
         {mode === "heatmap" && <span>{gazePts.length} gaze points</span>}
         {mode === "scanpath" && <span>{segFix.length} fixations</span>}
         {mode === "aoi" && <span>{areas.length} areas · {segFix.length} fixations</span>}

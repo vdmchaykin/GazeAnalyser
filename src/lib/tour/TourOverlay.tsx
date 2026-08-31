@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ArrowLeft, ArrowRight, Check, GraduationCap, Minus, MousePointerClick, X } from "lucide-react";
 import { findAnchor, type AnchorId } from "./anchors";
-import type { Placement } from "./steps";
+import type { Align, Placement } from "./steps";
 import { useTour } from "./TourProvider";
 
 const TOOLTIP_WIDTH = 340;
@@ -59,12 +59,27 @@ function fits(top: number, left: number, w: number, h: number) {
     top + h <= window.innerHeight - EDGE && left + w <= window.innerWidth - EDGE;
 }
 
-function positionFor(box: Box, w: number, h: number, placement: Placement) {
+/** Where the tooltip sits along the edge it is placed on. Centred by default;
+ *  "start"/"end" hug the anchor's near/far edge, which is how a step on a
+ *  full-width strip stays off whatever is centred underneath it. */
+function alignedLeft(box: Box, w: number, align: Align) {
+  if (align === "start") return box.left;
+  if (align === "end") return box.left + box.width - w;
+  return box.left + box.width / 2 - w / 2;
+}
+
+function alignedTop(box: Box, h: number, align: Align) {
+  if (align === "start") return box.top;
+  if (align === "end") return box.top + box.height - h;
+  return box.top + box.height / 2 - h / 2;
+}
+
+function positionFor(box: Box, w: number, h: number, placement: Placement, align: Align) {
   switch (placement) {
-    case "top":    return { top: box.top - GAP - h,   left: box.left + box.width / 2 - w / 2 };
-    case "bottom": return { top: box.top + box.height + GAP, left: box.left + box.width / 2 - w / 2 };
-    case "left":   return { top: box.top + box.height / 2 - h / 2, left: box.left - GAP - w };
-    default:       return { top: box.top + box.height / 2 - h / 2, left: box.left + box.width + GAP };
+    case "top":    return { top: box.top - GAP - h,   left: alignedLeft(box, w, align) };
+    case "bottom": return { top: box.top + box.height + GAP, left: alignedLeft(box, w, align) };
+    case "left":   return { top: alignedTop(box, h, align), left: box.left - GAP - w };
+    default:       return { top: alignedTop(box, h, align), left: box.left + box.width + GAP };
   }
 }
 
@@ -72,7 +87,9 @@ const OPPOSITE: Record<string, Placement> = {
   top: "bottom", bottom: "top", left: "right", right: "left",
 };
 
-function tooltipPosition(box: Box | null, w: number, h: number, placement: Placement, anchored: boolean) {
+function tooltipPosition(
+  box: Box | null, w: number, h: number, placement: Placement, align: Align, anchored: boolean,
+) {
   if (!box) {
     // An anchored step whose element is gone (a dialog opened over it, the
     // menu closed) parks in a corner so it never covers what the user needs.
@@ -84,9 +101,9 @@ function tooltipPosition(box: Box | null, w: number, h: number, placement: Place
     return { top: window.innerHeight / 2 - h / 2, left: window.innerWidth / 2 - w / 2 };
   }
 
-  let pos = positionFor(box, w, h, placement);
+  let pos = positionFor(box, w, h, placement, align);
   if (!fits(pos.top, pos.left, w, h)) {
-    const flipped = positionFor(box, w, h, OPPOSITE[placement] ?? "bottom");
+    const flipped = positionFor(box, w, h, OPPOSITE[placement] ?? "bottom", align);
     if (fits(flipped.top, flipped.left, w, h)) pos = flipped;
   }
   return {
@@ -97,13 +114,13 @@ function tooltipPosition(box: Box | null, w: number, h: number, placement: Place
 
 /** Transparent-black panels around the hole: they dim *and* block the rest of
  *  the UI, while the highlighted element stays clickable through the gap. */
-function Dimmer({ box, blocking }: { box: Box | null; blocking: boolean }) {
+function Dimmer({ box, blocking, dim }: { box: Box | null; blocking: boolean; dim: boolean }) {
   const block = (e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); };
-  const common = `fixed bg-black/60 z-[90]${blocking ? "" : " pointer-events-none"}`;
+  const common = `fixed z-[90]${dim ? " bg-black/60" : ""}${blocking ? "" : " pointer-events-none"}`;
 
-  // Nothing to spotlight and nothing to block — stay out of the way entirely,
-  // so a dialog the step sent the user into is shown undimmed.
-  if (!box && !blocking) return null;
+  // Neither darkening nor blocking: only the ring is left, and without a box
+  // there is nothing to ring — so stay out of the way entirely.
+  if (!box && (!blocking || !dim)) return null;
 
   if (!box) {
     return <div className={`${common} inset-0`} onMouseDown={block} onClick={block} />;
@@ -223,12 +240,12 @@ export function TourOverlay() {
   }
 
   const placement: Placement = step.placement ?? (box ? "bottom" : "center");
-  const pos = tooltipPosition(box, size.w, size.h, placement, !!step.anchor);
+  const pos = tooltipPosition(box, size.w, size.h, placement, step.align ?? "center", !!step.anchor);
   const progress = ((tour.stepIndex + 1) / tour.stepCount) * 100;
 
   return createPortal(
     <>
-      <Dimmer box={box} blocking={step.blocking ?? true} />
+      <Dimmer box={box} blocking={step.blocking ?? true} dim={step.dim ?? true} />
 
       <div
         ref={tooltipRef}

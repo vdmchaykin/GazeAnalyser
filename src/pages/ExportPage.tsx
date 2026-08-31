@@ -4,6 +4,7 @@ import { AlertCircle, ArrowRight, Check, Download, Loader2, Package } from "luci
 import { api } from "@/lib/api";
 import { confirmDialog } from "@/components/ConfirmDialog";
 import { RecordingPicker } from "@/components/picker/RecordingPicker";
+import { tourAnchor } from "@/lib/tour/anchors";
 import { GAZE_SOURCE_LABELS, type GazeSource, type NavPage, type Project, type RecordingMeta } from "@/types";
 
 interface ExportFile {
@@ -159,6 +160,7 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
     <div className="flex h-full">
       <RecordingPicker
         className="w-72 border-r border-zinc-800"
+        containerProps={tourAnchor("export.sourceList")}
         recordings={recordings}
         projects={projects}
         loading={loading}
@@ -183,7 +185,7 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
         <div className="flex-1 min-w-0 overflow-y-auto">
           <div className="max-w-2xl p-6">
             <div className="flex items-start gap-4 mb-5">
-              <div className="min-w-0 flex-1">
+              <div className="min-w-0 flex-1" {...tourAnchor("export.summary")}>
                 <h2 className="text-lg font-semibold text-white truncate">{source.label}</h2>
                 <p className="text-xs text-zinc-500 mt-0.5">
                   {manifest
@@ -203,6 +205,7 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
               </div>
 
               <button
+                {...tourAnchor("export.downloadAll")}
                 onClick={() => handleSave()}
                 disabled={!manifest || readyCount === 0 || busy !== null}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium shrink-0
@@ -234,6 +237,7 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
               </div>
             )}
 
+            <div {...tourAnchor("export.sections")}>
             {sections.map(sec => (
               <div key={sec.name} className="mb-5">
                 <p className="text-[10px] uppercase tracking-wider text-zinc-600 mb-2">{sec.name}</p>
@@ -256,6 +260,7 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
                 </div>
               </div>
             ))}
+            </div>
           </div>
         </div>
       )}

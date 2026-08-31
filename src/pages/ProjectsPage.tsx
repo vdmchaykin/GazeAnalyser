@@ -3,6 +3,7 @@ import {
   Plus, Upload, X, Brain, Flag, Target, Trash2, Cpu, Clock,
   User, FolderOpen, ArrowLeft, CalendarClock, ChevronRight, Play,
   LayoutGrid, List, FilePlus2, Library, ChevronDown, Check, Search, Pencil,
+  FileText, ChartScatter,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
@@ -11,7 +12,7 @@ import { confirmDialog } from "@/components/ConfirmDialog";
 import { tourAnchor, type AnchorId } from "@/lib/tour/anchors";
 import { emitTourEvent } from "@/lib/tour/events";
 import { isDemoRecording } from "@/lib/tour/demo";
-import type { Project, ProjectRef, RecordingMeta } from "@/types";
+import type { NavPage, Project, ProjectRef, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
 
@@ -24,8 +25,19 @@ const TILE_COLORS = [
   { icon: "text-rose-400",   bg: "bg-rose-500/10",   border: "border-rose-500/20",   hover: "hover:border-rose-400/50 hover:bg-rose-500/15" },
 ];
 
+/**
+ * Where the page was when it last unmounted.
+ *
+ * Opening the player replaces the whole app shell, so this component is torn
+ * down and its view state goes with it. Without this, coming back from the
+ * player dropped the user on the projects grid instead of the project — or the
+ * recording — they left from. Module-level on purpose: it is a UI breadcrumb,
+ * not data, and it should not survive a reload.
+ */
+let lastPlace: { projectId: string | null; recordingId: string | null } | null = null;
+
 interface ProjectsPageProps {
-  onNavigate: (page: "gaze" | "events" | "aoi", recording: RecordingMeta) => void;
+  onNavigate: (page: NavPage, recording: RecordingMeta) => void;
   onOpenPlayer: (id: string) => void;
 }
 
@@ -66,10 +78,44 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
 
   useEffect(() => { fetchProjects(); fetchAllRecs(); }, []);
 
+  // Put the user back where they were before the player took over the screen.
+  // Runs once the lists arrive, because the breadcrumb holds ids, not objects.
+  useEffect(() => {
+    const place = lastPlace;
+    if (!place || view !== "grid") return;
+    if (place.projectId) {
+      const project = projects.find((p) => p.id === place.projectId);
+      if (project) restoreProject(project, place.recordingId);
+      return;
+    }
+    if (place.recordingId) {
+      const rec = allRecs.find((r) => r.id === place.recordingId);
+      if (rec) { setSelectedRec(rec); setView("recording"); }
+    }
+  // Only the arrival of the lists should trigger this, never a later view change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projects, allRecs]);
+
+  /** Reopen a project (and optionally one of its recordings) without touching
+      the breadcrumb — this is a restore, not a navigation. */
+  const restoreProject = async (project: Project, recordingId: string | null) => {
+    setOpenProject(project);
+    setView("project");
+    try {
+      const recs = await api.get<RecordingMeta[]>(`/api/projects/${project.id}/recordings`);
+      setProjectRecs(recs);
+      const rec = recordingId ? recs.find((r) => r.id === recordingId) : null;
+      if (rec) { setSelectedRec(rec); setView("recording"); }
+    } catch {
+      setProjectRecs([]);
+    }
+  };
+
   const handleOpenProject = async (project: Project) => {
     setOpenProject(project);
     setSelectedRec(null);
     setView("project");
+    lastPlace = { projectId: project.id, recordingId: null };
     emitTourEvent("project:opened");
     try {
       const recs = await api.get<RecordingMeta[]>(`/api/projects/${project.id}/recordings`);
@@ -84,6 +130,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
     setOpenProject(null);
     setSelectedRec(null);
     setProjectRecs([]);
+    lastPlace = null;
   };
 
   // Import a new recording from a zip archive. Adds it to the database, and —
@@ -201,6 +248,7 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
     setOpenProject(null);
     setSelectedRec(rec);
     setView("recording");
+    lastPlace = { projectId: null, recordingId: rec.id };
   };
 
   // Delete a recording from the database entirely
@@ -355,7 +403,12 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
       {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-zinc-800 shrink-0">
         <button
-          onClick={selectedRec ? () => setSelectedRec(null) : handleBack}
+          onClick={selectedRec
+            ? () => {
+                setSelectedRec(null);
+                lastPlace = openProject ? { projectId: openProject.id, recordingId: null } : null;
+              }
+            : handleBack}
           className="flex items-center gap-1.5 text-zinc-400 hover:text-white transition-colors cursor-pointer"
         >
           <ArrowLeft className="w-4 h-4" />
@@ -475,7 +528,10 @@ export function ProjectsPage({ onNavigate, onOpenPlayer }: ProjectsPageProps) {
         ) : (
           <ProjectOverview
             recordings={projectRecs}
-            onSelect={setSelectedRec}
+            onSelect={(rec) => {
+              setSelectedRec(rec);
+              lastPlace = { projectId: openProject?.id ?? null, recordingId: rec.id };
+            }}
           />
         )}
       </div>
@@ -841,7 +897,7 @@ function RecordingDetail({
   rec, onNavigate, onOpenPlayer, onRemove, removeLabel = "Remove from project",
 }: {
   rec: RecordingMeta;
-  onNavigate: (page: "gaze" | "events" | "aoi", recording: RecordingMeta) => void;
+  onNavigate: (page: NavPage, recording: RecordingMeta) => void;
   onOpenPlayer: (id: string) => void;
   onRemove: () => void;
   removeLabel?: string;
@@ -893,6 +949,12 @@ function RecordingDetail({
       <div className="w-72 shrink-0 space-y-3 pt-1" {...tourAnchor("recording.actions")}>
         <p className="text-xs text-zinc-600 uppercase tracking-wider">Actions</p>
         <ActionButton
+          icon={<Play className="w-4 h-4" />}
+          label="Open in Player"
+          description="Watch the scene with the gaze overlays"
+          onClick={() => onOpenPlayer(rec.id)}
+        />
+        <ActionButton
           anchor="recording.calculateGaze"
           icon={<Brain className="w-4 h-4" />}
           label="Calculate Gaze"
@@ -910,6 +972,18 @@ function RecordingDetail({
           label="Annotate AoI"
           description="Draw areas of interest on the scene"
           onClick={() => onNavigate("aoi", rec)}
+        />
+        <ActionButton
+          icon={<FileText className="w-4 h-4" />}
+          label="Surface Map"
+          description="Check the page tracking and export its CSVs"
+          onClick={() => onNavigate("surface", rec)}
+        />
+        <ActionButton
+          icon={<ChartScatter className="w-4 h-4" />}
+          label="Visualise"
+          description="Heatmaps, AoI metrics and scanpaths"
+          onClick={() => onNavigate("visualisation", rec)}
         />
       </div>
     </div>

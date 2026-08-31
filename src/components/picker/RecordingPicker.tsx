@@ -8,9 +8,11 @@ import type { Project, ProjectRef, RecordingMeta } from "@/types";
  * The one recording picker every page uses: projects on top, each expanding to
  * the recordings inside it, loose recordings below.
  *
- * A recording is treated as belonging to a single project (its first membership)
- * — the schema allows several, but the app's workflow assumes one, and listing a
- * recording under two projects would make the same row appear twice.
+ * A recording appears under every project it belongs to. The schema allows
+ * several memberships and the app makes them easy to create — adding an
+ * existing recording to a second project is two clicks — so honouring only the
+ * first one left the other projects claiming "0 recordings" while the pages
+ * behind them worked on the recordings they said they did not have.
  */
 
 /** Which projects the user has expanded, shared by every page's picker. */
@@ -53,18 +55,20 @@ function groupByProject(
   const discovered: ProjectGroup[] = [];
 
   for (const rec of recordings) {
-    const project = rec.projects?.[0];
-    if (!project) {
+    const memberships = rec.projects ?? [];
+    if (memberships.length === 0) {
       loose.push(rec);
       continue;
     }
-    let group = byId.get(project.id);
-    if (!group) {
-      group = { id: project.id, name: project.name, recordings: [] };
-      byId.set(project.id, group);
-      discovered.push(group);
+    for (const project of memberships) {
+      let group = byId.get(project.id);
+      if (!group) {
+        group = { id: project.id, name: project.name, recordings: [] };
+        byId.set(project.id, group);
+        discovered.push(group);
+      }
+      group.recordings.push(rec);
     }
-    group.recordings.push(rec);
   }
 
   discovered.sort((a, b) => a.name.localeCompare(b.name));
@@ -131,8 +135,9 @@ export function RecordingPicker({
       const next = new Set(prev);
       let changed = false;
       for (const rec of wanted) {
-        const id = rec.projects?.[0]?.id;
-        if (id && !next.has(id)) { next.add(id); changed = true; }
+        for (const { id } of rec.projects ?? []) {
+          if (!next.has(id)) { next.add(id); changed = true; }
+        }
       }
       if (!changed) return prev;
       saveExpanded(next);

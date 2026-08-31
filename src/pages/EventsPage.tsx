@@ -6,6 +6,8 @@ import {
 import { api } from "@/lib/api";
 import { EventSeekbar, formatTs } from "@/components/player/EventSeekbar";
 import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
+import { tourAnchor } from "@/lib/tour/anchors";
+import { isDemoRecording } from "@/lib/tour/demo";
 import type { RecordingMeta, RecordingEvent } from "@/types";
 
 const API = "http://localhost:8765";
@@ -147,6 +149,7 @@ function InlinePlayer({
       <div
         className="relative flex-1 overflow-hidden cursor-pointer"
         onClick={toggle}
+        {...tourAnchor("events.video")}
       >
         <video
           ref={playerRef as React.RefObject<HTMLVideoElement>}
@@ -170,6 +173,7 @@ function InlinePlayer({
       {/* Controls */}
       <div className="flex flex-col gap-2 px-3 py-2.5 bg-zinc-900 border-t border-zinc-800">
         {/* Seekbar */}
+        <div {...tourAnchor("events.seekbar")}>
         <EventSeekbar
           events={events}
           duration={duration}
@@ -179,9 +183,10 @@ function InlinePlayer({
           colorB={colorB}
           colorCustom={colorCustom}
         />
+        </div>
 
         {/* Buttons */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2" {...tourAnchor("events.controls")}>
           <button onClick={toggle} className="text-white hover:text-indigo-400 transition-colors cursor-pointer">
             {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
           </button>
@@ -309,7 +314,8 @@ function EventsPanel({
   }, [currentTime, nextA, nextB, addEvent]);
 
   return (
-    <div className="flex flex-col h-full border-l border-zinc-800 bg-zinc-950">
+    <div className="flex flex-col h-full border-l border-zinc-800 bg-zinc-950"
+         {...tourAnchor("events.panel")}>
       {/* Header */}
       <div className="px-6 py-3 border-b border-zinc-800 shrink-0 flex items-center justify-between">
         <p className="text-sm font-medium text-white">Events</p>
@@ -320,7 +326,7 @@ function EventsPanel({
 
       {/* Manual add */}
       <div className="px-3 py-3 border-b border-zinc-800 shrink-0 space-y-2">
-        <div className="flex gap-2">
+        <div className="flex gap-2" {...tourAnchor("events.manualAdd")}>
           <input
             ref={inputRef}
             value={manualName}
@@ -343,7 +349,7 @@ function EventsPanel({
         </div>
 
         {/* TMT quick templates */}
-        <div className="space-y-1.5">
+        <div className="space-y-1.5" {...tourAnchor("events.templates")}>
           <p className="text-[10px] text-zinc-600 uppercase tracking-wider">Quick templates</p>
           <div className="flex gap-2">
             <button
@@ -393,7 +399,7 @@ function EventsPanel({
         </div>
 
         {/* Marker colors */}
-        <div className="space-y-1.5">
+        <div className="space-y-1.5" {...tourAnchor("events.colors")}>
           <button
             onClick={() => setColorsOpen((o) => !o)}
             className="flex items-center gap-1 cursor-pointer group"
@@ -423,7 +429,7 @@ function EventsPanel({
       </div>
 
       {/* Events list */}
-      <div className="flex-1 overflow-auto">
+      <div className="flex-1 overflow-auto" {...tourAnchor("events.list")}>
         {events.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 text-zinc-600">
             <ScanEye className="w-7 h-7 mb-2 opacity-30" />
@@ -551,6 +557,9 @@ export function EventsPage({ initialRecording }: { initialRecording?: RecordingM
         recordings={recordings}
         loading={loadingRecs}
         onSelect={handleSelect}
+        containerProps={tourAnchor("events.recordingList")}
+        rowProps={(rec) => (isDemoRecording(rec) ? tourAnchor("events.demoRecording") : undefined)}
+        autoExpand={isDemoRecording}
         emptyIcon={CalendarClock}
         placeholder="Select a recording to start event marking"
       />

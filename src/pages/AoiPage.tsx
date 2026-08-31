@@ -9,6 +9,8 @@ import {
 import { api } from "@/lib/api";
 import { confirmDialog } from "@/components/ConfirmDialog";
 import { RecordingPicker } from "@/components/picker/RecordingPicker";
+import { tourAnchor } from "@/lib/tour/anchors";
+import { emitTourEvent } from "@/lib/tour/events";
 import type { ProjectRef, RecordingMeta, RecordingEvent } from "@/types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -579,7 +581,8 @@ function AnnotateView({
       />
 
       {/* Segment tabs */}
-      <div className="flex items-center border-b border-zinc-800 px-2 shrink-0 bg-zinc-950">
+      <div className="flex items-center border-b border-zinc-800 px-2 shrink-0 bg-zinc-950"
+           {...tourAnchor("aoi.segmentTabs")}>
         {segments.map((seg) => (
           <button
             key={seg.id}
@@ -607,6 +610,7 @@ function AnnotateView({
           />
         ) : (
           <button
+            {...tourAnchor("aoi.addSegment")}
             onClick={() => setAddingTab(true)}
             title="Add segment"
             className="ml-1 px-2 py-1 text-zinc-500 hover:text-zinc-200 transition-colors cursor-pointer text-base leading-none"
@@ -667,6 +671,7 @@ function AoiTargetPicker({
       <RecordingPicker
         recordings={recordings}
         loading={loading}
+        containerProps={tourAnchor("aoi.targetList")}
         onSelect={onSelectRecording}
         onSelectProject={(p) => { onSelectProject(p); }}
         emptyIcon={CalendarClock}
@@ -812,6 +817,7 @@ function ScopeNotice({
 function Notice({ tone, children }: { tone: "info" | "warn"; children: ReactNode }) {
   return (
     <div
+      {...tourAnchor("aoi.scopeNotice")}
       className={`flex items-center gap-3 px-4 py-2 text-[11px] border-b border-zinc-800 shrink-0
         ${tone === "warn" ? "bg-zinc-900 text-amber-500/90" : "bg-zinc-900 text-zinc-500"}`}
     >
@@ -939,7 +945,8 @@ function FramePicker({
     <div className="flex flex-1 min-h-0">
       {/* Player */}
       <div className="flex flex-col flex-1 min-w-0 bg-black">
-        <div className="relative flex-1 overflow-hidden cursor-pointer" onClick={toggle}>
+        <div className="relative flex-1 overflow-hidden cursor-pointer" onClick={toggle}
+             {...tourAnchor("aoi.frameVideo")}>
           <video
             ref={videoRef}
             src={videoUrl}
@@ -958,7 +965,8 @@ function FramePicker({
         </div>
 
         {/* Controls */}
-        <div className="flex flex-col gap-2 px-3 py-2.5 bg-zinc-900 border-t border-zinc-800 shrink-0">
+        <div className="flex flex-col gap-2 px-3 py-2.5 bg-zinc-900 border-t border-zinc-800 shrink-0"
+             {...tourAnchor("aoi.frameControls")}>
           <div className="relative h-1.5">
             <div className="absolute inset-0 bg-zinc-700 rounded-full" />
             <div
@@ -998,6 +1006,7 @@ function FramePicker({
             ))}
             <div className="w-px h-4 bg-zinc-700 mx-1" />
             <button
+              {...tourAnchor("aoi.detectRun")}
               onClick={handleDetect}
               disabled={detecting}
               className="flex items-center gap-1.5 px-3 py-1 bg-indigo-600 hover:bg-indigo-500
@@ -1012,7 +1021,8 @@ function FramePicker({
       </div>
 
       {/* Result panel */}
-      <div className="w-80 shrink-0 border-l border-zinc-800 flex flex-col overflow-auto bg-zinc-950">
+      <div className="w-80 shrink-0 border-l border-zinc-800 flex flex-col overflow-auto bg-zinc-950"
+           {...tourAnchor("aoi.detectResult")}>
         <div className="px-4 py-3 border-b border-zinc-800">
           <span className="text-xs font-medium text-zinc-400">Detection result</span>
         </div>
@@ -1118,7 +1128,7 @@ function TagPicker({
       </div>
 
       {/* Interactive frame: click a tag to toggle it */}
-      <div>
+      <div {...tourAnchor("aoi.tagPreview")}>
         <p className="text-xs text-zinc-500 mb-1.5">Click a tag to exclude it</p>
         <div className="relative rounded-lg overflow-hidden border border-zinc-800">
           <img
@@ -1162,7 +1172,7 @@ function TagPicker({
 
       {/* Warp preview */}
       {(warpB64 || recomputing) && (
-        <div>
+        <div {...tourAnchor("aoi.warpPreview")}>
           <div className="flex items-center gap-2 mb-1.5">
             <p className="text-xs text-zinc-500">Warped paper preview</p>
             {recomputing && <Loader2 className="w-3 h-3 animate-spin text-zinc-500" />}
@@ -1177,6 +1187,7 @@ function TagPicker({
 
       {warpOk && warpB64 && (
         <button
+          {...tourAnchor("aoi.confirmFrame")}
           onClick={() => onConfirm(warpB64, selCount, result.tags.filter((t) => selectedIndices.has(t.index)))}
           disabled={recomputing}
           className="flex items-center justify-center gap-2 px-4 py-2.5
@@ -1274,6 +1285,7 @@ function ReferenceUploadModal({
                   className="max-h-[55vh] max-w-full rounded-lg border border-zinc-800 object-contain"
                 />
                 <button
+                  {...tourAnchor("aoi.uploadDropzone")}
                   onClick={() => fileInputRef.current?.click()}
                   disabled={detecting}
                   className="flex items-center gap-1.5 px-3 py-1 bg-zinc-800 hover:bg-zinc-700
@@ -1285,6 +1297,7 @@ function ReferenceUploadModal({
               </div>
             ) : (
               <button
+                {...tourAnchor("aoi.uploadDropzone")}
                 onClick={() => fileInputRef.current?.click()}
                 disabled={detecting}
                 className="flex flex-col items-center gap-3 px-10 py-12 border-2 border-dashed
@@ -1407,6 +1420,9 @@ function DrawCanvas({
     onAreasChange([...areas, newArea]);
     setSelectedId(id);
     setTool(lastDrawTool.current);
+    // Reported rather than watched from the DOM, because the A key reaches this
+    // same function without any click for the tour to see.
+    emitTourEvent("aoi:area-added");
   }, [areas, onAreasChange]);
 
   const cancelPolygon = useCallback(() => {
@@ -1628,7 +1644,8 @@ function DrawCanvas({
     <>
     <div className="flex flex-1 min-h-0 overflow-hidden">
       {/* Left panel: area list */}
-      <div className="w-52 border-r border-zinc-800 flex flex-col shrink-0 bg-zinc-950">
+      <div className="w-52 border-r border-zinc-800 flex flex-col shrink-0 bg-zinc-950"
+           {...tourAnchor("aoi.areaList")}>
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-zinc-800">
           <div className="min-w-0 flex flex-col">
             {refTimestamp !== null && refTimestamp >= 0 && (
@@ -1639,6 +1656,7 @@ function DrawCanvas({
             </span>
           </div>
           <button
+            {...tourAnchor("aoi.addArea")}
             onClick={() => addArea()}
             className="shrink-0 flex items-center gap-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-500
                        text-white text-xs rounded-md transition-colors cursor-pointer ml-2"
@@ -1710,6 +1728,7 @@ function DrawCanvas({
         {/* Bottom actions */}
         <div className="border-t border-zinc-800 p-3 flex flex-col gap-2">
           <button
+            {...tourAnchor("aoi.save")}
             onClick={handleSave}
             disabled={saving}
             className="flex items-center justify-center gap-2 px-3 py-1.5 w-full
@@ -1720,6 +1739,7 @@ function DrawCanvas({
             {saveOk ? "Saved!" : saving ? "Saving…" : saveLabel}
           </button>
           <button
+            {...tourAnchor("aoi.redetect")}
             onClick={onRedetect}
             className="flex items-center justify-center gap-1.5 px-3 py-1.5 w-full
                        text-zinc-500 hover:text-white text-xs rounded-md
@@ -1734,7 +1754,8 @@ function DrawCanvas({
       {/* Right: toolbar + canvas */}
       <div className="flex-1 flex flex-col min-w-0 bg-zinc-950">
         {/* Toolbar */}
-        <div className="flex items-center gap-1.5 px-4 py-2 border-b border-zinc-800 shrink-0">
+        <div className="flex items-center gap-1.5 px-4 py-2 border-b border-zinc-800 shrink-0"
+             {...tourAnchor("aoi.tools")}>
           <ToolButton active={tool === "select"} onClick={() => setTool("select")} title="Select (V)">
             <MousePointer2 className="w-4 h-4" />
           </ToolButton>
@@ -1759,7 +1780,7 @@ function DrawCanvas({
           </button>
 
           {/* Right side: reference image menu */}
-          <div className="ml-auto relative">
+          <div className="ml-auto relative" {...tourAnchor("aoi.referenceMenu")}>
             <button
               onClick={() => setMenuOpen((o) => !o)}
               className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded transition-colors cursor-pointer
@@ -1776,7 +1797,7 @@ function DrawCanvas({
                 <div className="absolute right-0 mt-1 z-50 w-56 bg-zinc-900 border border-zinc-700
                                 rounded-lg shadow-xl py-1 text-xs">
                   {hasReference && (
-                    <>
+                    <div {...tourAnchor("aoi.backgroundSwitch")}>
                       <p className="px-3 pt-1 pb-0.5 text-[10px] uppercase tracking-wide text-zinc-600">
                         Background
                       </p>
@@ -1793,9 +1814,10 @@ function DrawCanvas({
                         onClick={() => { if (!usingReference) onToggleBackground(); setMenuOpen(false); }}
                       />
                       <div className="my-1 border-t border-zinc-800" />
-                    </>
+                    </div>
                   )}
                   <button
+                    {...tourAnchor("aoi.uploadReference")}
                     onClick={() => { setShowUpload(true); setMenuOpen(false); }}
                     className="w-full flex items-center gap-2 px-3 py-1.5 text-left
                                text-zinc-300 hover:bg-zinc-800 cursor-pointer transition-colors"
@@ -1814,6 +1836,7 @@ function DrawCanvas({
           <div
             className="relative shadow-2xl overflow-hidden flex-shrink-0"
             style={{ aspectRatio: "794 / 1123", height: "calc(100% - 16px)" }}
+            {...tourAnchor("aoi.canvas")}
           >
             {warpedImage ? (
               <img

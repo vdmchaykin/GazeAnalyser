@@ -5,6 +5,8 @@ import { SurfacePositionsPanel } from "@/components/exports/SurfacePositionsPane
 import { AoiFixationsPanel } from "@/components/exports/AoiFixationsPanel";
 import { EventSeekbar } from "@/components/player/EventSeekbar";
 import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
+import { tourAnchor } from "@/lib/tour/anchors";
+import { isDemoRecording } from "@/lib/tour/demo";
 import { applyMat, nearestIndex, unitSquareToQuad, type Mat3 } from "@/lib/sceneAnchor";
 import { drawGazeRing } from "@/lib/gazeMarker";
 import { makeLens, type Lens } from "@/lib/lensDistortion";
@@ -719,6 +721,9 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
         recordings={recordings}
         loading={loadingRecs}
         onSelect={handleSelectRecording}
+        containerProps={tourAnchor("surface.recordingList")}
+        rowProps={(rec) => (isDemoRecording(rec) ? tourAnchor("surface.demoRecording") : undefined)}
+        autoExpand={isDemoRecording}
         emptyIcon={Activity}
         placeholderIcon={Activity}
         placeholder="Select a recording to visualize gaze on paper"
@@ -756,7 +761,8 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
         <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
           {/* Segment tabs */}
           {segments.length > 0 && (
-            <div className="flex items-center border-b border-zinc-800 px-2 shrink-0 bg-zinc-950">
+            <div className="flex items-center border-b border-zinc-800 px-2 shrink-0 bg-zinc-950"
+                 {...tourAnchor("surface.segmentTabs")}>
               {segments.map(seg => (
                 <button
                   key={seg.id}
@@ -777,6 +783,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
             {/* Scene video with the AprilTag surface overlay */}
             <div
               ref={videoWrapRef}
+              {...tourAnchor("surface.scene")}
               className="relative flex-1 min-w-0 h-full bg-black rounded border border-zinc-800 overflow-hidden"
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
@@ -836,6 +843,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
             <div
               className="relative shrink-0 flex items-center justify-center"
               style={{ aspectRatio: `${PAPER_W}/${PAPER_H}`, height: "100%", maxWidth: "45%" }}
+              {...tourAnchor("surface.paper")}
             >
               {loading ? (
                 <div className="flex items-center justify-center h-full gap-2 text-zinc-500 text-sm">
@@ -860,7 +868,8 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
           </div>
 
           {/* Timeline + controls */}
-          <div className="shrink-0 border-t border-zinc-800 bg-zinc-900 px-4 pt-3 pb-3 space-y-2">
+          <div className="shrink-0 border-t border-zinc-800 bg-zinc-900 px-4 pt-3 pb-3 space-y-2"
+               {...tourAnchor("surface.timeline")}>
             <EventSeekbar
               events={events}
               duration={duration}
@@ -869,7 +878,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
               disabled={loading || !duration}
             />
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3" {...tourAnchor("surface.controls")}>
               <button
                 onClick={handleReset}
                 disabled={loading || !duration}
@@ -895,7 +904,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
               </span>
 
               {/* Overlay toggles */}
-              <div className="flex items-center gap-3 ml-auto">
+              <div className="flex items-center gap-3 ml-auto" {...tourAnchor("surface.overlayToggles")}>
                 <button
                   onClick={() => setShowOutline(v => !v)}
                   className={toggleCls(showOutline, "text-blue-400 hover:text-blue-300")}
@@ -945,17 +954,22 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
         </div>
 
         {/* Right sidebar: export panels */}
-        <aside className="w-64 border-l border-zinc-800 shrink-0 overflow-y-auto bg-zinc-950">
+        <aside className="w-64 border-l border-zinc-800 shrink-0 overflow-y-auto bg-zinc-950"
+               {...tourAnchor("surface.exports")}>
           <div className="px-2.5 py-2 border-b border-zinc-800">
             <p className="text-[10px] uppercase tracking-wider text-zinc-600">Exports</p>
           </div>
           <div className="flex flex-col gap-2.5 p-2.5">
-            <SurfacePositionsPanel
-              recordingId={recording.id}
-              segmentId={activeSegId}
-              hasSurface={hasSurface}
-            />
-            <AoiFixationsPanel recordingId={recording.id} />
+            <div {...tourAnchor("surface.positionsPanel")}>
+              <SurfacePositionsPanel
+                recordingId={recording.id}
+                segmentId={activeSegId}
+                hasSurface={hasSurface}
+              />
+            </div>
+            <div {...tourAnchor("surface.aoiFixationsPanel")}>
+              <AoiFixationsPanel recordingId={recording.id} />
+            </div>
           </div>
         </aside>
       </div>

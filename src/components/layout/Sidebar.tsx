@@ -12,13 +12,15 @@ const topItems: { id: Page; label: string; Icon: React.ElementType; anchor?: Anc
   { id: "projects", label: "Projects", Icon: Layers, anchor: "sidebar.projects" },
   { id: "player", label: "Player", Icon: Play },
   { id: "gaze", label: "Gaze", Icon: ScanEye, anchor: "sidebar.gaze" },
-  { id: "events", label: "Events", Icon: Flag },
-  { id: "aoi", label: "AoI", Icon: Target },
-  { id: "surface", label: "Surface Map", Icon: FileText },
-  { id: "visualisation", label: "Visualise", Icon: ChartScatter },
+  { id: "events", label: "Events", Icon: Flag, anchor: "sidebar.events" },
+  { id: "aoi", label: "AoI", Icon: Target, anchor: "sidebar.aoi" },
+  { id: "surface", label: "Surface Map", Icon: FileText, anchor: "sidebar.surface" },
+  { id: "visualisation", label: "Visualise", Icon: ChartScatter, anchor: "sidebar.visualisation" },
 ];
 
-const exportItem = { id: "export" as Page, label: "Export", Icon: Download };
+const exportItem = {
+  id: "export" as Page, label: "Export", Icon: Download, anchor: "sidebar.export" as AnchorId,
+};
 
 function NavButton({
   id, label, Icon, current, onChange, anchor,

@@ -7,7 +7,8 @@ export type TourEventName =
   | "project:created"
   | "project:opened"
   | "recording:added"
-  | "recording:selected";
+  | "recording:selected"
+  | "aoi:area-added";
 
 type Listener = (name: TourEventName) => void;
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
-  Play, Pause, Eye, EyeOff, Volume2, VolumeX, Maximize2, ScanEye, CircleDot, Route, Cloud,
+  Play, Pause, Eye, EyeOff, Volume2, VolumeX, Maximize2, Minimize2, ScanEye, CircleDot, Route, Cloud,
 } from "lucide-react";
 import type {
   CloudGaze, Fixation, GazePrediction, PupilData, SceneMotionData, SurfacePositionsData,
@@ -45,6 +45,7 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
   const sceneRef = useRef<HTMLVideoElement>(null);
   const eyeRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const seekRef = useRef<HTMLInputElement>(null);
   const gazeDotRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number>(0);
@@ -747,7 +748,29 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  // Esc and F11 leave fullscreen without going through the button, so the icon
+  // follows the document rather than our own click.
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  // Fullscreen the *container*, not the <video>: the gaze, scanpath and pupil
+  // overlays are canvases layered over it, and fullscreening the bare video
+  // element would drop every one of them. Both calls are promise-returning and
+  // reject silently when the webview refuses, so failures are logged rather
+  // than swallowed.
+  const toggleFullscreen = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const p = document.fullscreenElement
+      ? document.exitFullscreen()
+      : el.requestFullscreen();
+    p?.catch((e) => console.error("Fullscreen refused", e));
+  };
 
   return (
     <div className="flex flex-col h-full bg-black">
@@ -1036,10 +1059,11 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
 
           <button
             {...tourAnchor("player.fullscreen")}
-            onClick={() => sceneRef.current?.requestFullscreen()}
+            onClick={toggleFullscreen}
+            title={isFullscreen ? "Leave fullscreen (Esc)" : "Fullscreen"}
             className="text-zinc-400 hover:text-white transition-colors cursor-pointer"
           >
-            <Maximize2 className="w-4 h-4" />
+            {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
           </button>
         </div>
       </div>
