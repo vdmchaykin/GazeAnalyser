@@ -27,10 +27,35 @@ data.zip
 *.zip
 backend/venv/
 
+# HeatmapNet weights (~56 MB) — see README.md for how to place them
+backend/app/vendor/checkpoints/
+
+# Packaged backend produced by PyInstaller
+backend/build/
+backend/dist/
+
+# Model weights, wherever they land
+*.pth
+
 # Python
 __pycache__/
 *.pyc
 *.pyo
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment overrides (GAZEANALYZER_DATA_DIR, GAZEANALYZER_HEATMAP_CKPT, …)
+.env
+.env.*
+!.env.example
+
+# OS clutter
+Thumbs.db
+desktop.ini
 
 # Claude Code local settings
 .claude/settings.local.json

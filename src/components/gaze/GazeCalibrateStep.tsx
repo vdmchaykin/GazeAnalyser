@@ -6,7 +6,7 @@ import { useSceneAnchor, type AnchorMode } from "@/lib/useSceneAnchor";
 import { tourAnchor } from "@/lib/tour/anchors";
 import type { CalibrationPoint, GazeAnalysisState, RecordingMeta } from "@/types";
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 const TOTAL_POINTS = 9;
 
 interface Props {

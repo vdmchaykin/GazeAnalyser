@@ -1,14 +1,10 @@
 import json
-import sys
 import zipfile
 import shutil
 from pathlib import Path
 from typing import Optional
 
-RECORDINGS_DIR = Path(__file__).parent.parent.parent.parent / "data" / "recordings"
-
-_GAZE_EST_DIR = Path(__file__).parent.parent.parent.parent.parent.parent / "Gaze_estimation"
-_GAZE_ENV_SITE = str(_GAZE_EST_DIR / "gaze_env" / "lib" / "python3.12" / "site-packages")
+from app.paths import RECORDINGS_DIR
 
 
 def _find_file(folder: Path, pattern: str) -> Optional[Path]:
@@ -32,10 +28,7 @@ def _extract_zip_flat(zip_path: Path, dest: Path) -> None:
 
 def _run_convert_to_csv(recording_dir: Path) -> None:
     """Convert Neon binary files to CSV. Output is always placed in recording_dir/csv/."""
-    for p in (_GAZE_ENV_SITE, str(_GAZE_EST_DIR)):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    from pipeline.convert_to_csv import convert_recording
+    from app.vendor.pipeline.convert_to_csv import convert_recording
 
     _MARKER_FILES = ["gaze ps1.raw", "imu ps1.raw", "event.txt"]
 

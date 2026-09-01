@@ -14,7 +14,7 @@ import { emitTourEvent } from "@/lib/tour/events";
 import { isDemoRecording } from "@/lib/tour/demo";
 import type { NavPage, Project, ProjectRef, RecordingMeta } from "@/types";
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 
 const TILE_COLORS = [
   { icon: "text-indigo-400", bg: "bg-indigo-500/10", border: "border-indigo-500/20", hover: "hover:border-indigo-400/50 hover:bg-indigo-500/15" },

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Upload, Clock, User, Cpu, Brain, Trash2, Play } from "lucide-react";
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 import { api } from "@/lib/api";
 import { formatDuration, formatDate } from "@/lib/utils";
 import { confirmDialog } from "@/components/ConfirmDialog";

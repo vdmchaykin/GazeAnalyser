@@ -1,5 +1,4 @@
 import json
-import sys
 import threading
 from pathlib import Path
 from typing import Optional  # noqa: F401 — used in _build_homographies
@@ -10,6 +9,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.database import get_db
+from app.paths import HEATMAP_CKPT
 from app.api.routes.aoi import (
     _aoi_dir,
     _get_recording,
@@ -34,7 +34,6 @@ from app.api.routes.aoi import (
     write_source,
 )
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent.parent / "Gaze_estimation"))
 
 router = APIRouter(prefix="/api/recordings/{recording_id}/gaze", tags=["gaze"])
 
@@ -218,8 +217,6 @@ async def get_frame(recording_id: str, t: float = 0.0, frac: float | None = None
 
 # ── pupil detection ────────────────────────────────────────────────────────
 
-_GAZE_SITE = str(Path(__file__).parents[5] / "Gaze_estimation" / "gaze_env" / "lib" / "python3.12" / "site-packages")
-_HEATMAP_CKPT = str(Path(__file__).parents[5] / "Gaze_estimation" / "checkpoints_openeds" / "openeds_finetuned_lpw_validated.pth")
 
 
 class DetectRequest(BaseModel):
@@ -252,9 +249,7 @@ class DetectRequest(BaseModel):
 
 
 def _floodfill_cfg_from(req: "DetectRequest"):
-    if _GAZE_SITE not in sys.path:
-        sys.path.insert(0, _GAZE_SITE)
-    from pipeline.pupil_detector import DetectorConfig
+    from app.vendor.pipeline.pupil_detector import DetectorConfig
     return DetectorConfig(
         heatmap_roi_size=req.heatmap_roi_size,
         floodfill_lo_diff=req.floodfill_lo_diff,
@@ -269,9 +264,7 @@ def _floodfill_cfg_from(req: "DetectRequest"):
 
 
 def _edge_cfg_from(req: "DetectRequest"):
-    if _GAZE_SITE not in sys.path:
-        sys.path.insert(0, _GAZE_SITE)
-    from pipeline.pupil_detector import EdgeDetectorConfig
+    from app.vendor.pipeline.pupil_detector import EdgeDetectorConfig
     return EdgeDetectorConfig(
         heatmap_roi_size=req.heatmap_roi_size,
         canny_low=req.edge_canny_low,
@@ -660,22 +653,18 @@ def _run_pupil_detection(recording_id: str, eye_path: str, folder_path: str, out
     job["status"] = "running"
 
     try:
-        import sys as _sys
-        if _GAZE_SITE not in _sys.path:
-            _sys.path.insert(0, _GAZE_SITE)
-
-        from pipeline.pupil_detector import (
+        from app.vendor.pipeline.pupil_detector import (
             build_combined_detector, DetectorConfig, EdgeDetectorConfig,
             FrameContext, EdgeFrameContext, CombinedFrameContext,
         )
 
-        if not Path(_HEATMAP_CKPT).exists():
-            raise FileNotFoundError(f"HeatmapNet checkpoint not found: {_HEATMAP_CKPT}")
+        if not HEATMAP_CKPT.exists():
+            raise FileNotFoundError(f"HeatmapNet checkpoint not found: {HEATMAP_CKPT}")
 
         job["message"] = "Loading HeatmapNet model…"
         floodfill_cfg = _floodfill_cfg_from(cfg)
         edge_cfg = _edge_cfg_from(cfg)
-        detector, _device = build_combined_detector(floodfill_cfg, edge_cfg, _HEATMAP_CKPT)
+        detector, _device = build_combined_detector(floodfill_cfg, edge_cfg, str(HEATMAP_CKPT))
 
         cap = cv2.VideoCapture(eye_path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -865,19 +854,17 @@ def _debug_config_key(req: "DebugRequest") -> tuple:
 
 def _get_debug_detector(req: "DebugRequest"):
     """Build (or reuse) a combined detector for the given config."""
-    if _GAZE_SITE not in sys.path:
-        sys.path.insert(0, _GAZE_SITE)
-    from pipeline.pupil_detector import build_combined_detector
+    from app.vendor.pipeline.pupil_detector import build_combined_detector
 
     key = _debug_config_key(req)
     if _debug_detector["key"] == key and _debug_detector["detector"] is not None:
         return _debug_detector["detector"]
 
-    if not Path(_HEATMAP_CKPT).exists():
-        raise HTTPException(status_code=500, detail=f"HeatmapNet checkpoint not found: {_HEATMAP_CKPT}")
+    if not HEATMAP_CKPT.exists():
+        raise HTTPException(status_code=500, detail=f"HeatmapNet checkpoint not found: {HEATMAP_CKPT}")
     floodfill_cfg = _floodfill_cfg_from(req)
     edge_cfg = _edge_cfg_from(req)
-    detector, _device = build_combined_detector(floodfill_cfg, edge_cfg, _HEATMAP_CKPT)
+    detector, _device = build_combined_detector(floodfill_cfg, edge_cfg, str(HEATMAP_CKPT))
     _debug_detector["key"] = key
     _debug_detector["detector"] = detector
     return detector
@@ -894,9 +881,7 @@ def _png_b64(img: np.ndarray) -> str:
 
 def _debug_stage_images(eye_bgr: np.ndarray, detector, roi_size: int) -> dict:
     """Run the floodfill detector on one eye image and render its stages."""
-    if _GAZE_SITE not in sys.path:
-        sys.path.insert(0, _GAZE_SITE)
-    from pipeline.pupil_detector import FrameContext
+    from app.vendor.pipeline.pupil_detector import FrameContext
 
     h, w = eye_bgr.shape[:2]
     ctx = FrameContext(frame_idx=0, roi_rect=(0, 0, w, h))
@@ -1050,9 +1035,7 @@ def _draw_ellipse_on(roi_gray, ell, color, x_off=0, y_off=0, thickness=1):
 def _eye_stage_tiles(eye_bgr, floodfill_det, edge_det) -> tuple:
     """Run both pipelines on one eye and build the labelled stage tiles."""
     import math as _m
-    if _GAZE_SITE not in sys.path:
-        sys.path.insert(0, _GAZE_SITE)
-    from pipeline.pupil_detector import FrameContext, EdgeFrameContext
+    from app.vendor.pipeline.pupil_detector import FrameContext, EdgeFrameContext
 
     h, w = eye_bgr.shape[:2]
     ff_ctx = FrameContext(frame_idx=0, roi_rect=(0, 0, w, h))

@@ -1,4 +1,4 @@
-const BASE_URL = "http://localhost:8765";
+import { API_BASE as BASE_URL } from "./apiBase";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, options);

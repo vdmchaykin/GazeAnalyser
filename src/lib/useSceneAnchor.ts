@@ -17,8 +17,8 @@ import {
   unitSquareToQuad, type Mat3,
 } from "./sceneAnchor";
 import type { SceneMotionData, SurfacePositionsData } from "@/types";
+import { API_BASE as API } from "@/lib/apiBase";
 
-const API = "http://localhost:8765";
 
 /** Which transform carried a point into the current frame. */
 export type AnchorMode = "surface" | "flow" | "fixed";

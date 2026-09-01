@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Film } from "lucide-react";
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 
 interface RecordingThumbnailProps {
   recordingId: string;

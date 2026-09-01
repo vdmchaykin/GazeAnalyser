@@ -4,7 +4,7 @@ import { confirmDialog } from "@/components/ConfirmDialog";
 import { tourAnchor } from "@/lib/tour/anchors";
 import type { BlinkResult, GazeAnalysisState, RecordingMeta } from "@/types";
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 
 interface Props {
   recording: RecordingMeta;

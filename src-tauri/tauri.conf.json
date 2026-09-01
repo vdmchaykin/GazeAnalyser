@@ -10,17 +10,8 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "GazeAnalyzer",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 600
-      }
-    ],
     "security": {
-      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src http://localhost:8765 ws://localhost:*; img-src 'self' data: asset: https://asset.localhost; media-src http://localhost:8765 asset: https://asset.localhost"
+      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src http://127.0.0.1:* http://localhost:* ws://localhost:*; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:* asset: https://asset.localhost; media-src http://127.0.0.1:* http://localhost:* asset: https://asset.localhost"
     }
   },
   "bundle": {
@@ -32,6 +23,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../backend/dist/gazeanalyzer-backend": "backend"
+    }
   }
 }

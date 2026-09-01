@@ -14,7 +14,7 @@ import type {
   RecordingMeta, RecordingEvent, GazePrediction, SurfacePositionsData,
 } from "@/types";
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 
 const PAPER_W = 794;
 const PAPER_H = 1123;
@@ -350,6 +350,9 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
   // rebuildBgCanvas is stable (no deps) so it is safe to omit
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setBgImage]);
+
+  // Only switchable when the segment actually stored both warps.
+  const canToggleBg = bgAvailable.video && bgAvailable.reference;
 
   /** Swap the painted warp — the AoI editor keeps both for the same page. */
   const handleToggleBackground = () => {
@@ -849,14 +852,22 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
 
               {/* Which warp the A4 canvas shows. Both come from the AoI editor:
                   the frame picked out of this recording's video, and the crisp
-                  reference scan uploaded for the same page. */}
-              {bgAvailable.video && bgAvailable.reference && (
+                  reference image uploaded for the same page. A segment that has
+                  only one of them keeps the button visible but inert, so it is
+                  clear what it does and why it cannot switch here. */}
+              {hasSurface && (
                 <button
                   onClick={handleToggleBackground}
-                  title="Switch the A4 background between the reference scan and the video frame"
+                  disabled={!canToggleBg}
+                  title={canToggleBg
+                    ? "Switch the A4 background between the uploaded reference image and the video frame"
+                    : bgMode === "video"
+                      ? "This segment has no uploaded reference image — add one in the AoI editor"
+                      : "This segment has no warped video frame — pick one in the AoI editor"}
                   className="ml-auto mr-1 flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px]
                              font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700
-                             transition-colors cursor-pointer"
+                             transition-colors cursor-pointer
+                             disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-zinc-800"
                 >
                   <ImageIcon className="w-3.5 h-3.5 text-zinc-500" />
                   {bgMode === "reference" ? "Reference image" : "Video frame"}

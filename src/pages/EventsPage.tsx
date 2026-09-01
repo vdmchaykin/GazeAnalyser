@@ -10,7 +10,7 @@ import { tourAnchor } from "@/lib/tour/anchors";
 import { isDemoRecording } from "@/lib/tour/demo";
 import type { RecordingMeta, RecordingEvent } from "@/types";
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 
 // ─── TMT sequence generators ──────────────────────────────────────────────────
 

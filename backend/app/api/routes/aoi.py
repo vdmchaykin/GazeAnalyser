@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from app.database import get_db
 from app.services.recording_service import RECORDINGS_DIR
+from app.paths import PROJECTS_DIR
 
 try:
     import pupil_apriltags as apriltag
@@ -200,7 +201,6 @@ def _aoi_dir(folder_path: str) -> Path:
 # written before projects existed are exactly such overrides, so they keep working
 # untouched until the user drops them.
 
-PROJECTS_DIR = RECORDINGS_DIR.parent / "projects"
 
 
 def _project_aoi_dir(project_id: str) -> Path:

@@ -14,7 +14,7 @@ import { SceneAnchorPanel, type AnchorStats } from "@/components/anchor/SceneAnc
 // Trailing time window (seconds) of fixations drawn in the scanpath overlay.
 const SCANPATH_WINDOW_S = 3;
 
-const API = "http://localhost:8765";
+import { API_BASE as API } from "@/lib/apiBase";
 
 interface VideoPlayerProps {
   recordingId: string;

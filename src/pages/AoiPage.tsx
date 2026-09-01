@@ -6,6 +6,7 @@ import {
   Play, Pause, Volume2, VolumeX, ImageUp, Image as ImageIcon, Video, ChevronDown, Check,
   FolderOpen,
 } from "lucide-react";
+import { API_BASE } from "@/lib/apiBase";
 import { api } from "@/lib/api";
 import { confirmDialog } from "@/components/ConfirmDialog";
 import { RecordingPicker } from "@/components/picker/RecordingPicker";
@@ -122,7 +123,6 @@ const PALETTE = [
   "#f43f5e", "#10b981", "#3b82f6", "#8b5cf6",
 ];
 
-const API_BASE = "http://localhost:8765";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
