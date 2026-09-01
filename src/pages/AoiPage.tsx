@@ -700,7 +700,14 @@ function AoiTargetPicker({
   );
 }
 
-/** Which recording's video supplies the reference frame and the tag detection. */
+const recordingLabel = (rec: RecordingMeta) =>
+  rec.wearer_name ? `${rec.wearer_name} — ${rec.name}` : rec.name;
+
+/** Which recording's video supplies the reference frame and the tag detection.
+ *
+ * Drawn by us rather than as a native `<select>`: the platform paints that
+ * popup in the system colour scheme and keeps whatever scheme the widget was
+ * created with, so it came out unreadable in one theme or the other. */
 function SourceSelect({
   recordings, value, onChange,
 }: {
@@ -708,23 +715,60 @@ function SourceSelect({
   value: RecordingMeta;
   onChange: (rec: RecordingMeta) => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   return (
-    <select
-      value={value.id}
-      onChange={(e) => {
-        const rec = recordings.find((r) => r.id === e.target.value);
-        if (rec) onChange(rec);
-      }}
-      className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-200
-                 outline-none cursor-pointer max-w-[220px]"
-    >
-      {recordings.map((rec) => (
-        <option key={rec.id} value={rec.id} disabled={!rec.scene_video}>
-          {rec.wearer_name ? `${rec.wearer_name} — ${rec.name}` : rec.name}
-          {rec.scene_video ? "" : " (no video)"}
-        </option>
-      ))}
-    </select>
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        title="Which recording's video the reference frame comes from"
+        className="flex items-center gap-1.5 max-w-[220px] px-2 py-1 rounded text-xs
+                   bg-zinc-900 border border-zinc-700 text-zinc-200 hover:bg-zinc-800
+                   transition-colors cursor-pointer"
+      >
+        <span className="truncate">{recordingLabel(value)}</span>
+        <ChevronDown className="w-3.5 h-3.5 shrink-0 text-zinc-500" />
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-1 w-72 z-40 max-h-72 overflow-auto
+                        bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl">
+          {recordings.map((rec) => {
+            const usable = !!rec.scene_video;
+            return (
+              <button
+                key={rec.id}
+                disabled={!usable}
+                onClick={() => { onChange(rec); setOpen(false); }}
+                className={`w-full flex items-center gap-2 px-3 py-2 text-left text-xs
+                            border-b border-zinc-800/70 last:border-b-0 transition-colors
+                            ${usable ? "text-zinc-200 hover:bg-zinc-800 cursor-pointer"
+                                     : "text-zinc-500 cursor-not-allowed"}`}
+              >
+                <Check className={`w-3.5 h-3.5 shrink-0 ${rec.id === value.id ? "text-emerald-400" : "text-transparent"}`} />
+                <span className="truncate">{recordingLabel(rec)}</span>
+                {!usable && <span className="ml-auto shrink-0 text-[10px] text-zinc-600">no video</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 

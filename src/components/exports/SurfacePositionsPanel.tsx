@@ -19,17 +19,24 @@ interface SurfaceStatus {
  * reference frame if a legacy state has none).
  */
 export function SurfacePositionsPanel({
-  recordingId, segmentId, hasSurface, onSave,
+  recordingId, segmentId, hasSurface, onSave, onGenerated,
 }: {
   recordingId: string;
   segmentId: string;
   hasSurface: boolean;
   onSave?: () => Promise<void>;
+  /** A run just finished — the page can re-read the new surface_positions.csv. */
+  onGenerated?: () => void | Promise<void>;
 }) {
   const [status, setStatus] = useState<SurfaceStatus | null>(null);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Whether the last status we saw was a run in progress, so the transition to
+  // "done" (or a cancel that still wrote rows) fires onGenerated exactly once.
+  const wasRunningRef = useRef(false);
+  const onGeneratedRef = useRef(onGenerated);
+  useEffect(() => { onGeneratedRef.current = onGenerated; }, [onGenerated]);
 
   const base = `/api/recordings/${recordingId}/aoi/surface-positions`;
 
@@ -37,10 +44,15 @@ export function SurfacePositionsPanel({
     try {
       const s = await api.get<SurfaceStatus>(base);
       setStatus(s);
-      if (s.status !== "running" && pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
+      if (s.status !== "running") {
+        if (pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+        // The file the page draws from was just rewritten — let it reload.
+        if (wasRunningRef.current && s.has_file) onGeneratedRef.current?.();
       }
+      wasRunningRef.current = s.status === "running";
     } catch { /* keep last status */ }
   }, [base]);
 
@@ -64,6 +76,7 @@ export function SurfacePositionsPanel({
       if (onSave) await onSave();  // persist selected_tags so the backend can rebuild the surface
       await api.post(`${base}?segment_id=${encodeURIComponent(segmentId)}`, {});
       setStatus({ status: "running", progress: 0, total: 0, has_file: false });
+      wasRunningRef.current = true;
       startPolling();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to start");

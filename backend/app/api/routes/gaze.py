@@ -80,6 +80,8 @@ def _gaze_state_dict(folder_path: str, source: str) -> dict:
         "source": source,
         "available_sources": _available_sources(folder_path),
         "pupils_done": (gdir / "pupils.csv").exists(),
+        # Blinks come out of the pupil detection, so they only exist for "own".
+        "blinks_done": (_gaze_dir(folder_path) / "blinks.csv").exists(),
         "calibration_done": calibration_done,
         "mapping_done": (gdir / "gaze_predictions.csv").exists(),
         "fixations_done": (gdir / "fixations.csv").exists(),
@@ -96,7 +98,7 @@ def _gaze_state_dict(folder_path: str, source: str) -> dict:
 # calibration matching and the mapping, etc.).
 _FIXATION_FILES = ["fixations.csv", "fixations_on_surface.csv", "fixations_result.json"]
 _STAGE_FILES: dict[str, list[str]] = {
-    "pupils": ["pupils.csv", "pupils_30fps.csv", "detection_stats.json", "calibration_points.json", "gaze_predictions.csv", "mapping_result.json", *_FIXATION_FILES],
+    "pupils": ["pupils.csv", "pupils_30fps.csv", "detection_stats.json", "blinks.csv", "blinks_result.json", "calibration_points.json", "gaze_predictions.csv", "mapping_result.json", *_FIXATION_FILES],
     "calibration": ["calibration_points.json", "gaze_predictions.csv", "mapping_result.json", *_FIXATION_FILES],
     "mapping": ["gaze_predictions.csv", "mapping_result.json", *_FIXATION_FILES],
     "fixations": [*_FIXATION_FILES],
@@ -496,6 +498,160 @@ def _plateau_bounds(ts_marks: list) -> list:
     return bounds
 
 
+# ── blink detection (from the pupil detector's own output) ──────────────────
+#
+# A blink is the eyelid covering the pupil, so both eyes lose their pupil at the
+# same time for roughly a tenth of a second. That is exactly what the detector
+# reports as a run of frames with no (or a barely-confident) pupil on either
+# side, and the eye camera's ~200 Hz gives ~20-60 frames to see it in.
+#
+# The hard part is telling a blink from bad tracking, which looks the same
+# frame-by-frame. Three guards separate them:
+#   * duration — a real closure lasts 60-700 ms; anything longer is tracking loss
+#     and anything shorter is a single dropped frame,
+#   * merge gap — one stray detection inside a closure must not split it in two,
+#   * surroundings — the eye has to be tracked on both sides of the closure. A
+#     closure inside a stretch where the detector finds nothing anyway is not
+#     evidence of a blink, so it is dropped.
+# `detection_quality` reports how much of the recording was trackable at all, so
+# a wholly unreliable detection can be flagged rather than silently believed.
+
+_BLINK_COLS = [
+    "section id", "recording id", "blink id",
+    "start timestamp [ns]", "end timestamp [ns]", "duration [ms]",
+]
+
+
+class BlinkRequest(BaseModel):
+    """Thresholds for `_detect_blinks` — the defaults are what runs automatically."""
+    min_confidence: float = 0.5      # below this the pupil counts as not found
+    merge_gap_ms: float = 50.0       # stray detections inside one closure
+    min_duration_ms: float = 60.0
+    max_duration_ms: float = 700.0
+    surround_ms: float = 200.0       # window checked on each side of a closure
+    surround_min_frac: float = 0.6   # of it must have at least one eye tracked
+
+
+# Below this fraction of trackable frames the blink count is not to be trusted.
+_BLINK_QUALITY_FLOOR = 0.85
+
+
+def _blink_section_id(recording_id: str) -> str:
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"blinks:{recording_id}"))
+
+
+def _bool_runs(mask: np.ndarray) -> list:
+    """[start, end) index pairs of every True run in `mask`."""
+    m = mask.astype(np.int8)
+    edges = np.diff(np.concatenate(([0], m, [0])))
+    return list(zip(np.flatnonzero(edges == 1).tolist(), np.flatnonzero(edges == -1).tolist()))
+
+
+def _detect_blinks(pupils_csv: Path, req: "BlinkRequest") -> tuple:
+    """Blinks and their stats from a finished pupils.csv.
+
+    Returns ``(blinks, stats)``; `blinks` are dicts with the id, both timestamps
+    and the duration in ms, in time order."""
+    import pandas as pd
+
+    df = pd.read_csv(pupils_csv)
+    if df.empty:
+        return [], {
+            "n_blinks": 0, "blinks_per_min": 0.0,
+            "mean_duration_ms": 0.0, "median_duration_ms": 0.0,
+            "detection_quality": 0.0, "reliable": False,
+        }
+
+    # ns timestamps need all 64 bits; the float copy is only for the arithmetic.
+    ts_ns = df["timestamp [ns]"].to_numpy(dtype=np.int64)
+    ts = ts_ns.astype(np.float64)
+
+    def _conf(col: str) -> np.ndarray:
+        if col not in df.columns:
+            return np.full(len(df), np.nan)
+        return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
+
+    conf_l = _conf("confidence_L")
+    conf_r = _conf("confidence_R")
+    # NaN (detector found nothing) compares false, which is what we want here.
+    with np.errstate(invalid="ignore"):
+        ok_l = conf_l >= req.min_confidence
+        ok_r = conf_r >= req.min_confidence
+    tracked = ok_l | ok_r          # the eye camera saw *an* eye
+    closed = ~ok_l & ~ok_r         # neither eye had a pupil
+
+    span_s = (ts[-1] - ts[0]) / 1e9 if len(ts) > 1 else 0.0
+    quality = float(tracked.mean())
+
+    # Merge closures separated by less than merge_gap_ms — a single frame the
+    # detector got through mid-blink must not cut the blink in half.
+    merged: list = []
+    for s, e in _bool_runs(closed):
+        if merged and (ts[s] - ts[merged[-1][1] - 1]) / 1e6 <= req.merge_gap_ms:
+            merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+
+    blinks: list = []
+    for s, e in merged:
+        last = min(e, len(ts) - 1)
+        duration_ms = (ts[last] - ts[s]) / 1e6
+        if duration_ms < req.min_duration_ms or duration_ms > req.max_duration_ms:
+            continue
+        # The eye must be tracked around the closure, else this is tracking loss.
+        win = req.surround_ms * 1e6
+        pre = tracked[(ts >= ts[s] - win) & (ts < ts[s])]
+        post = tracked[(ts > ts[last]) & (ts <= ts[last] + win)]
+        pre_frac = float(pre.mean()) if pre.size else 1.0
+        post_frac = float(post.mean()) if post.size else 1.0
+        if min(pre_frac, post_frac) < req.surround_min_frac:
+            continue
+        blinks.append({
+            "blink_id": len(blinks) + 1,
+            "start_ts": int(ts_ns[s]),
+            "end_ts": int(ts_ns[last]),
+            "duration_ms": float(duration_ms),
+        })
+
+    durs = [b["duration_ms"] for b in blinks]
+    return blinks, {
+        "n_blinks": len(blinks),
+        "blinks_per_min": round(len(blinks) / (span_s / 60), 2) if span_s > 0 else 0.0,
+        "mean_duration_ms": round(float(np.mean(durs)), 1) if durs else 0.0,
+        "median_duration_ms": round(float(np.median(durs)), 1) if durs else 0.0,
+        "detection_quality": round(quality, 3),
+        "reliable": quality >= _BLINK_QUALITY_FLOOR,
+        "min_confidence": req.min_confidence,
+        "merge_gap_ms": req.merge_gap_ms,
+        "min_duration_ms": req.min_duration_ms,
+        "max_duration_ms": req.max_duration_ms,
+    }
+
+
+def _write_blinks(gdir: Path, recording_id: str, blinks: list) -> None:
+    """Pupil-compatible blinks.csv, one row per blink."""
+    import csv as csv_mod
+    section_id = _blink_section_id(recording_id)
+    with open(gdir / "blinks.csv", "w", newline="") as f:
+        w = csv_mod.writer(f)
+        w.writerow(_BLINK_COLS)
+        for b in blinks:
+            w.writerow([
+                section_id, recording_id, b["blink_id"],
+                b["start_ts"], b["end_ts"], round(b["duration_ms"]),
+            ])
+
+
+def _generate_blinks(recording_id: str, pupils_csv: Path, req: "BlinkRequest") -> dict:
+    """Detect, write blinks.csv next to the pupils, and persist the stats."""
+    blinks, stats = _detect_blinks(pupils_csv, req)
+    gdir = pupils_csv.parent
+    _write_blinks(gdir, recording_id, blinks)
+    (gdir / "blinks_result.json").write_text(json.dumps(stats, indent=2))
+    return stats
+
+
 def _run_pupil_detection(recording_id: str, eye_path: str, folder_path: str, out_csv: Path, cfg: DetectRequest):
     import math
     import csv as csv_mod
@@ -644,9 +800,20 @@ def _run_pupil_detection(recording_id: str, eye_path: str, folder_path: str, out
             # non-fatal: mapping rebuilds the 30-fps table from pupils.csv on demand
             job["message"] = f"Clean step skipped ({clean_err}); mapping will rebuild it."
 
+        # ── blinks: both eyes lose their pupil together while the lid is down,
+        # which the detector has just recorded frame by frame ────────────────
+        job["message"] = "Detecting blinks…"
+        blink_stats = {}
+        try:
+            blink_stats = _generate_blinks(recording_id, out_csv, BlinkRequest())
+            job["blinks"] = blink_stats
+        except Exception as blink_err:
+            # non-fatal: pupils.csv is the deliverable, blinks can be redone later
+            job["message"] = f"Blink detection skipped ({blink_err})."
+
         stats_file = out_csv.parent / "detection_stats.json"
         import json as _json
-        stats_file.write_text(_json.dumps({"mean_confidence": mean_conf}))
+        stats_file.write_text(_json.dumps({"mean_confidence": mean_conf, "blinks": blink_stats}))
         job["status"] = "done"
 
     except Exception as e:
@@ -1071,18 +1238,62 @@ async def detect_status(recording_id: str):
                 mean_conf = 0.0
                 if stats_file.exists():
                     mean_conf = json.loads(stats_file.read_text()).get("mean_confidence", 0.0)
-                return {"status": "done", "progress": 0, "total": 0, "mean_confidence": mean_conf}
+                return {
+                    "status": "done", "progress": 0, "total": 0,
+                    "mean_confidence": mean_conf, "blinks": _read_blink_stats(gdir),
+                }
         except Exception:
             pass
         return {"status": "idle", "progress": 0, "total": 0, "mean_confidence": 0.0}
     job = _detect_jobs[recording_id]
+    blinks = job.get("blinks")
+    if blinks is None:
+        try:
+            rec = await _get_recording(recording_id)
+            blinks = _read_blink_stats(_gaze_dir(rec["folder_path"]))
+        except Exception:
+            blinks = None
     return {
         "status": job["status"],
         "progress": job.get("progress", 0),
         "total": job.get("total", 0),
         "mean_confidence": job.get("mean_confidence", 0.0),
+        "blinks": blinks,
         "message": job.get("message"),
     }
+
+
+def _read_blink_stats(gdir: Path):
+    """The stats of the last blink detection, or None if it never ran."""
+    f = gdir / "blinks_result.json"
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+@router.get("/blinks/result")
+async def get_blinks_result(recording_id: str):
+    """Stats of the blink detection that ran with the last pupil detection."""
+    rec = await _get_recording(recording_id)
+    return _read_blink_stats(_gaze_dir(rec["folder_path"]))
+
+
+@router.post("/blinks")
+async def compute_blinks(recording_id: str, req: Optional[BlinkRequest] = None):
+    """Re-run blink detection on the stored pupils.csv.
+
+    Blinks are produced automatically at the end of pupil detection; this exists
+    for recordings detected before that, and for re-running with other thresholds
+    without paying for the whole video again."""
+    rec = await _get_recording(recording_id)
+    gdir = _gaze_dir(rec["folder_path"])
+    pupils_csv = gdir / "pupils.csv"
+    if not pupils_csv.exists():
+        raise HTTPException(status_code=400, detail="Run Step 1 — Pupil Detection first")
+    return _generate_blinks(recording_id, pupils_csv, req or BlinkRequest())
 
 
 # ── calibration ────────────────────────────────────────────────────────────

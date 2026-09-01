@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Eye, EyeOff, Frame, Pause, Play, RotateCcw, ScanEye, Square } from "lucide-react";
+import { Activity, Eye, EyeOff, Frame, ImageIcon, Pause, Play, RotateCcw, ScanEye, Square } from "lucide-react";
 import { api } from "@/lib/api";
 import { SurfacePositionsPanel } from "@/components/exports/SurfacePositionsPanel";
 import { AoiFixationsPanel } from "@/components/exports/AoiFixationsPanel";
@@ -52,6 +52,18 @@ interface AoiArea {
 interface SegmentMeta {
   id: string; label: string; eventPrefix: string | null;
 }
+
+/** The two warps the AoI editor can store for a segment — see `BgMode`. */
+interface AoiStateResponse {
+  areas?: AoiArea[];
+  warped_image_b64?: string | null;          // whichever of the two is active
+  video_warped_image_b64?: string | null;    // warp of the picked scene frame
+  reference_image_b64?: string | null;       // warp of an uploaded reference scan
+  using_reference?: boolean;
+}
+
+/** Which warp is painted behind the AoI shapes on the A4 canvas. */
+type BgMode = "video" | "reference";
 
 // ─── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -201,6 +213,12 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
   const [segments, setSegments] = useState<SegmentMeta[]>([]);
   const [activeSegId, setActiveSegId] = useState("general");
   const [hasSurface, setHasSurface] = useState(false);
+  // Which of the segment's two warps is painted behind the AoI shapes, and which
+  // of them this segment actually has (the button only appears with both).
+  const [bgMode, setBgMode] = useState<BgMode>("video");
+  const [bgAvailable, setBgAvailable] = useState<{ video: boolean; reference: boolean }>(
+    { video: false, reference: false },
+  );
   // null while unknown; false when surface_positions.csv has not been generated,
   // which is exactly what the video overlay is drawn from.
   const [surfaceLocalized, setSurfaceLocalized] = useState<number | null>(null);
@@ -233,8 +251,11 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
 
   // Stable data refs for the RAF loop (avoid stale closures)
   const predsRef = useRef<GazePrediction[]>([]);
-  const paperImgRef = useRef<HTMLImageElement | null>(null);
-  const lastWarpedRef = useRef<string | null>(null);
+  // Both warps decoded once per segment, keyed by the base64 they came from so a
+  // tab switch back does not decode them again. `bgModeRef` picks the painted one.
+  const paperImgsRef = useRef<Record<BgMode, HTMLImageElement | null>>({ video: null, reference: null });
+  const paperSrcRef = useRef<Record<BgMode, string | null>>({ video: null, reference: null });
+  const bgModeRef = useRef<BgMode>("video");
   const aoiAreasRef = useRef<AoiArea[]>([]);
   const durationRef = useRef(0);
 
@@ -272,35 +293,98 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
       .finally(() => setLoadingRecs(false));
   }, []);
 
+  /** Decode one warp into its slot, or clear the slot when the segment has none. */
+  const setBgImage = useCallback((slot: BgMode, b64: string | null) => {
+    if (b64 === paperSrcRef.current[slot]) return;   // already decoded
+    paperSrcRef.current[slot] = b64;
+    if (!b64) {
+      paperImgsRef.current[slot] = null;
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      // A tab switch during the decode may have replaced this slot's source.
+      if (paperSrcRef.current[slot] !== b64) return;
+      paperImgsRef.current[slot] = img;
+      rebuildBgCanvas();
+      dirtyRef.current = true;
+    };
+    img.src = `data:image/jpeg;base64,${b64}`;
+  }, []);
+
   const loadAoiState = useCallback(async (recId: string, segId: string) => {
     try {
-      const state = await api.get<{ areas: AoiArea[]; warped_image_b64: string | null }>(
+      const state = await api.get<AoiStateResponse>(
         `/api/recordings/${recId}/aoi/${segId}/state`,
       );
       aoiAreasRef.current = state.areas ?? [];
-      const b64 = state.warped_image_b64 ?? null;
-      setHasSurface(!!b64);
+      const active = state.warped_image_b64 ?? null;
+      // States saved before the editor kept the two warps apart carry only the
+      // active one; `using_reference` says which of the two that is.
+      const video = state.video_warped_image_b64 ?? (state.using_reference ? null : active);
+      const reference = state.reference_image_b64 ?? (state.using_reference ? active : null);
+      setHasSurface(!!active);
+      setBgAvailable({ video: !!video, reference: !!reference });
 
-      if (b64 && b64 !== lastWarpedRef.current) {
-        lastWarpedRef.current = b64;
-        const img = new Image();
-        img.onload = () => { paperImgRef.current = img; rebuildBgCanvas(); dirtyRef.current = true; };
-        img.src = `data:image/jpeg;base64,${b64}`;
-      } else {
-        if (!b64) { lastWarpedRef.current = null; paperImgRef.current = null; }
-        rebuildBgCanvas();
-        dirtyRef.current = true;
-      }
+      setBgImage("video", video);
+      setBgImage("reference", reference);
+      // Follow the editor's choice, falling back to whichever warp exists.
+      const mode: BgMode = state.using_reference && reference ? "reference"
+        : video ? "video"
+        : reference ? "reference"
+        : "video";
+      bgModeRef.current = mode;
+      setBgMode(mode);
+
+      rebuildBgCanvas();
+      dirtyRef.current = true;
     } catch {
       aoiAreasRef.current = [];
-      lastWarpedRef.current = null;
-      paperImgRef.current = null;
+      setBgImage("video", null);
+      setBgImage("reference", null);
+      setBgAvailable({ video: false, reference: false });
       setHasSurface(false);
       rebuildBgCanvas();
       dirtyRef.current = true;
     }
   // rebuildBgCanvas is stable (no deps) so it is safe to omit
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setBgImage]);
+
+  /** Swap the painted warp — the AoI editor keeps both for the same page. */
+  const handleToggleBackground = () => {
+    const next: BgMode = bgModeRef.current === "reference" ? "video" : "reference";
+    if (!paperImgsRef.current[next]) return;
+    bgModeRef.current = next;
+    setBgMode(next);
+    rebuildBgCanvas();
+    dirtyRef.current = true;
+  };
+
+  /** The per-frame surface geometry the video overlay is drawn from.
+   *
+   * Re-read whenever surface_positions.csv is (re)generated, so the outline and
+   * the derived gaze ring appear without leaving the page. */
+  const loadSurfacePositions = useCallback(async (recId: string) => {
+    try {
+      const d = await api.get<SurfacePositionsData>(
+        `/api/recordings/${recId}/aoi/surface-positions/data`,
+      );
+      cornersRef.current = d.corners ?? [];
+      seenMarkersRef.current = d.markers ?? [];
+      registryRef.current = d.registry ?? {};
+      lensRef.current = makeLens(d.intrinsics);
+      setSurfaceLocalized(d.localized);
+      setHasSurfacePositions(true);
+    } catch {
+      cornersRef.current = [];
+      seenMarkersRef.current = [];
+      registryRef.current = {};
+      lensRef.current = makeLens(null);
+      setSurfaceLocalized(null);
+      setHasSurfacePositions(false);
+    }
+    dirtyRef.current = true;
   }, []);
 
   const loadAll = useCallback(async (rec: RecordingMeta) => {
@@ -335,24 +419,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
         })
         .catch(() => { /* recordings without a scene .time file fall back to fractions */ });
 
-      api.get<SurfacePositionsData>(`/api/recordings/${rec.id}/aoi/surface-positions/data`)
-        .then(d => {
-          cornersRef.current = d.corners ?? [];
-          seenMarkersRef.current = d.markers ?? [];
-          registryRef.current = d.registry ?? {};
-          lensRef.current = makeLens(d.intrinsics);
-          setSurfaceLocalized(d.localized);
-          setHasSurfacePositions(true);
-          dirtyRef.current = true;
-        })
-        .catch(() => {
-          cornersRef.current = [];
-          seenMarkersRef.current = [];
-          registryRef.current = {};
-          lensRef.current = makeLens(null);
-          setSurfaceLocalized(null);
-          setHasSurfacePositions(false);
-        });
+      loadSurfacePositions(rec.id);
 
       const segs = deriveSegments(evts);
       try {
@@ -371,7 +438,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
     } finally {
       setLoading(false);
     }
-  }, [loadAoiState]);
+  }, [loadAoiState, loadSurfacePositions]);
 
   useEffect(() => {
     if (initialRecording) loadAll(initialRecording);
@@ -382,7 +449,11 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
     setPredictions([]); predsRef.current = [];
     setEvents([]);
     setSegments([]);
-    aoiAreasRef.current = []; lastWarpedRef.current = null; paperImgRef.current = null;
+    aoiAreasRef.current = [];
+    paperImgsRef.current = { video: null, reference: null };
+    paperSrcRef.current = { video: null, reference: null };
+    setBgAvailable({ video: false, reference: false });
+    bgModeRef.current = "video"; setBgMode("video");
     sceneTsRef.current = new Float64Array(0);
     sceneRelRef.current = new Float64Array(0);
     cornersRef.current = []; seenMarkersRef.current = []; registryRef.current = {};
@@ -438,7 +509,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
       bgCanvasRef.current.height = PAPER_H;
     }
     const ctx = bgCanvasRef.current.getContext("2d");
-    if (ctx) drawBg(ctx, paperImgRef.current, aoiAreasRef.current);
+    if (ctx) drawBg(ctx, paperImgsRef.current[bgModeRef.current], aoiAreasRef.current);
   }
 
   /** The scene frame shown at playback position `t`, or -1 without a .time file. */
@@ -775,6 +846,22 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
                   {seg.label}
                 </button>
               ))}
+
+              {/* Which warp the A4 canvas shows. Both come from the AoI editor:
+                  the frame picked out of this recording's video, and the crisp
+                  reference scan uploaded for the same page. */}
+              {bgAvailable.video && bgAvailable.reference && (
+                <button
+                  onClick={handleToggleBackground}
+                  title="Switch the A4 background between the reference scan and the video frame"
+                  className="ml-auto mr-1 flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px]
+                             font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700
+                             transition-colors cursor-pointer"
+                >
+                  <ImageIcon className="w-3.5 h-3.5 text-zinc-500" />
+                  {bgMode === "reference" ? "Reference image" : "Video frame"}
+                </button>
+              )}
             </div>
           )}
 
@@ -965,6 +1052,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
                 recordingId={recording.id}
                 segmentId={activeSegId}
                 hasSurface={hasSurface}
+                onGenerated={() => loadSurfacePositions(recording.id)}
               />
             </div>
             <div {...tourAnchor("surface.aoiFixationsPanel")}>

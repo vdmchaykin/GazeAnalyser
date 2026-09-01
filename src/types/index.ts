@@ -104,6 +104,7 @@ export interface GazeAnalysisState {
   calibration_done: boolean;
   mapping_done: boolean;
   fixations_done: boolean;
+  blinks_done: boolean;
   cloud_gaze_done: boolean;
   cloud_fixations_done: boolean;
   calibration_points: CalibrationPoint[];
@@ -119,6 +120,18 @@ export interface Fixation {
   on_surface: boolean;
   norm_x: number | null;
   norm_y: number | null;
+}
+
+/** Stats of the blink detection that runs with pupil detection. */
+export interface BlinkResult {
+  n_blinks: number;
+  blinks_per_min: number;
+  mean_duration_ms: number;
+  median_duration_ms: number;
+  /** Fraction of frames where at least one eye was tracked at all. */
+  detection_quality: number;
+  /** False when the tracking was too poor for the blink count to mean anything. */
+  reliable: boolean;
 }
 
 export interface FixationResult {

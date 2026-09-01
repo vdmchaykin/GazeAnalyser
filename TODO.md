@@ -189,3 +189,21 @@ sudo apt-get install -y \
   patchelf
 ```
 
+
+
+- [x] 1. In dark theme change color in AoI of source frame choice
+      — native `<select>` popups follow the system scheme; pinned per theme in `index.css`.
+- [x] 2. In surface map add button changing the background of the A4 paper
+      — toggles the AoI editor's two warps (reference image ↔ video frame).
+- [x] 3. In visualise make the button, showing pipeline, active
+      — the read-only source badge is now a working source picker (`GazeSourcePicker`).
+- [x] 4. In visualise fix the offset button, now its immediately working only for heatmap,
+      it needed to be working also for aoi heatmap and scanpath
+      — the preview re-aggregates each fixation's surface position, so all three modes follow it.
+- [x] 5. Add blink data generation
+      — runs automatically at the end of pupil detection: both eyes lose their pupil
+      together for 60-700 ms, merged over stray frames, rejected inside untracked
+      stretches. Writes Pupil-format `blinks.csv` (+ Export entry); `POST /gaze/blinks`
+      re-runs it on already-detected pupils.
+- [x] 6. When surface_position.csv is generated the page should be updated automatically
+      — the panel reports the run's end and Surface Map re-reads the per-frame geometry. 

@@ -5,9 +5,9 @@ import { api } from "@/lib/api";
 import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
 import { tourAnchor } from "@/lib/tour/anchors";
 import { isDemoRecording } from "@/lib/tour/demo";
-import { GazeSourceBadge } from "@/components/gaze/GazeSourceBadge";
+import { GazeSourcePicker } from "@/components/gaze/GazeSourcePicker";
 import { GazeOffsetPanel, type PaperPreview } from "@/components/gaze/GazeOffsetPanel";
-import type { RecordingMeta, RecordingEvent, GazePrediction, Fixation } from "@/types";
+import type { RecordingMeta, RecordingEvent, GazePrediction, Fixation, GazeSource } from "@/types";
 
 // Surface (warped paper) canvas resolution — shared with AoI / Surface Map so
 // normalized surface coords (0..1) map the same way everywhere.
@@ -134,6 +134,49 @@ function shapePath(ctx: CanvasRenderingContext2D, s: AoiShape) {
       i === 0 ? ctx.moveTo(x * PAPER_W, y * PAPER_H) : ctx.lineTo(x * PAPER_W, y * PAPER_H));
     ctx.closePath();
   }
+}
+
+
+/**
+ * The fixations as they would be with the previewed offset applied.
+ *
+ * A constant scene-pixel shift cannot change the I-DT segmentation (dispersion is
+ * translation-invariant), which is why applying an offset only rebuilds the
+ * fixation files from the same boundaries. So the preview keeps every fixation's
+ * time window and re-aggregates its surface position from the previewed samples
+ * inside it — the same mean-of-on-surface-members rule the backend uses.
+ */
+function reaggregateFixations(
+  fixs: Fixation[], preds: GazePrediction[], preview: PaperPreview,
+): Fixation[] {
+  if (!fixs.length || preds.length !== preview.length) return fixs;
+
+  // First sample at or after `t` (predictions arrive time-ordered).
+  const firstAtOrAfter = (t: number): number => {
+    let lo = 0, hi = preds.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (preds[mid].timestamp_ns < t) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  };
+
+  return fixs.map(f => {
+    let n = 0, on = 0, sx = 0, sy = 0;
+    for (let i = firstAtOrAfter(f.start_ts_ns); i < preds.length; i++) {
+      if (preds[i].timestamp_ns > f.end_ts_ns) break;
+      n++;
+      const [px, py] = preview[i];
+      if (px !== null && py !== null) { on++; sx += px; sy += py; }
+    }
+    if (n === 0) return f;   // no sample in the window — leave it as stored
+    return {
+      ...f,
+      on_surface: on >= Math.max(1, n / 2),
+      norm_x: on ? sx / on : null,
+      norm_y: on ? sy / on : null,
+    };
+  });
 }
 
 // ─── Canvas renderers ──────────────────────────────────────────────────────────
@@ -330,6 +373,9 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
   const [saving, setSaving] = useState(false);
   // Paper coords the offset panel is previewing; null = the stored mapping.
   const [preview, setPreview] = useState<PaperPreview | null>(null);
+  // The source the data on screen came from. Each source keeps its own gaze,
+  // fixations and offset, so the offset panel is remounted when it changes.
+  const [gazeSource, setGazeSource] = useState<GazeSource | null>(null);
 
   // Canvas kept in state (not a ref) so the render effect re-runs once it mounts.
   const [canvas, setCanvas] = useState<HTMLCanvasElement | null>(null);
@@ -452,14 +498,22 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
       p.paper_x !== null && p.paper_y !== null && p.timestamp_ns >= lo && p.timestamp_ns <= hi);
   }, [shownPreds, windowNs]);
 
+  // The scanpath and the AoI metrics are built from fixations, so the offset
+  // preview has to reach them too — otherwise dragging the slider moves only the
+  // heatmap and the three modes disagree until Apply.
+  const shownFix = useMemo(
+    () => (preview ? reaggregateFixations(fixations, predictions, preview) : fixations),
+    [fixations, predictions, preview],
+  );
+
   const segFix = useMemo(() => {
     const lo = windowNs?.[0] ?? -Infinity;
     const hi = windowNs?.[1] ?? Infinity;
-    return fixations
+    return shownFix
       .filter(f => f.on_surface && f.norm_x !== null && f.norm_y !== null
         && f.start_ts_ns >= lo && f.start_ts_ns <= hi)
       .sort((a, b) => a.start_ts_ns - b.start_ts_ns);
-  }, [fixations, windowNs]);
+  }, [shownFix, windowNs]);
 
   const aoiValues = useMemo<AoiValue[]>(() => {
     return areas.filter(a => a.shape).map(area => {
@@ -557,7 +611,16 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
         <span className="text-sm font-medium text-white">{recording.name}</span>
         {recording.wearer_name && <span className="text-xs text-zinc-500">{recording.wearer_name}</span>}
         <div className="flex-1" />
-        <GazeSourceBadge recordingId={recording.id} />
+        <GazeSourcePicker
+          recordingId={recording.id}
+          align="right"
+          disabled={loading}
+          onChanged={(source) => {
+            setGazeSource(source);
+            setPreview(null);
+            return loadAll(recording);
+          }}
+        />
       </div>
 
       {/* Mode switch + mode controls */}
@@ -608,6 +671,7 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
 
           <div {...tourAnchor("vis.offsetPanel")}>
             <GazeOffsetPanel
+              key={gazeSource ?? "stored"}
               recordingId={recording.id}
               onPreview={setPreview}
               onApplied={reloadGaze}

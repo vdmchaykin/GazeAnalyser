@@ -46,6 +46,7 @@ const EMPTY_STATE: GazeAnalysisState = {
   calibration_done: false,
   mapping_done: false,
   fixations_done: false,
+  blinks_done: false,
   cloud_gaze_done: false,
   cloud_fixations_done: false,
   calibration_points: [],

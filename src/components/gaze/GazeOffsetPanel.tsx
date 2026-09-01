@@ -192,8 +192,8 @@ export function GazeOffsetPanel({
           </div>
 
           <p className="text-[10px] text-zinc-600 mt-2 leading-snug">
-            The preview redraws the heatmap only. Applying rewrites the mapped gaze,
-            rebuilds the fixations (scanpath, AoI) and clears the AoI metrics export.
+            The preview redraws every view — heatmap, scanpath and AoI. Applying rewrites
+            the mapped gaze, rebuilds the fixations and clears the AoI metrics export.
           </p>
         </div>
       )}

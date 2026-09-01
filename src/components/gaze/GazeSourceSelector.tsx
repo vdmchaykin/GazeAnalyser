@@ -22,10 +22,13 @@ interface Props {
   available: GazeSource[];
   onChange: (source: GazeSource) => void;
   disabled?: boolean;
+  /** Which edge the dropdown hangs from — "right" keeps it inside the window
+      when the button itself sits at the right edge of a header. */
+  align?: "left" | "right";
 }
 
 /** Picks which gaze a recording is analysed from — see GazeSource. */
-export function GazeSourceSelector({ value, available, onChange, disabled }: Props) {
+export function GazeSourceSelector({ value, available, onChange, disabled, align = "left" }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -56,8 +59,8 @@ export function GazeSourceSelector({ value, available, onChange, disabled }: Pro
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full mt-1 w-80 z-30 bg-zinc-900 border border-zinc-700
-                        rounded-lg shadow-xl overflow-hidden">
+        <div className={`absolute ${align === "right" ? "right-0" : "left-0"} top-full mt-1 w-80 z-30
+                        bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl overflow-hidden`}>
           {ALL.map((s) => {
             const usable = available.includes(s);
             return (

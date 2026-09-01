@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Play, RefreshCw, CheckCircle2, Trash2, ChevronDown, Eye } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
 import { tourAnchor } from "@/lib/tour/anchors";
-import type { GazeAnalysisState, RecordingMeta } from "@/types";
+import type { BlinkResult, GazeAnalysisState, RecordingMeta } from "@/types";
 
 const API = "http://localhost:8765";
 
@@ -18,6 +18,8 @@ interface DetectStatus {
   progress: number;
   total: number;
   mean_confidence: number;
+  /** Blinks are detected from the same pass — null until it has run. */
+  blinks?: BlinkResult | null;
   message?: string;
 }
 
@@ -127,6 +129,10 @@ export function GazeDetectStep({ recording, done: initialDone, onDone, onDeleted
     mean_confidence: 0,
   });
 
+  // Blinks fall out of the detection run; this only covers recordings whose
+  // pupils were detected before blink detection existed.
+  const [blinking, setBlinking] = useState(false);
+
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cancelledRef = useRef(false);
 
@@ -166,6 +172,24 @@ export function GazeDetectStep({ recording, done: initialDone, onDone, onDeleted
 
     return () => { cancelledRef.current = true; stopPolling(); };
   }, []);
+
+  const handleDetectBlinks = async () => {
+    setBlinking(true);
+    try {
+      const res = await fetch(`${API}/api/recordings/${recording.id}/gaze/blinks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blinks: BlinkResult = await res.json();
+      setJobStatus((s) => ({ ...s, blinks }));
+    } catch {
+      /* leave the stats missing — the button stays available */
+    } finally {
+      setBlinking(false);
+    }
+  };
 
   const handleRun = async () => {
     setJobStatus({ status: "running", progress: 0, total: 0, mean_confidence: 0, message: "Starting…" });
@@ -499,13 +523,67 @@ export function GazeDetectStep({ recording, done: initialDone, onDone, onDeleted
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-3"
            {...tourAnchor("gaze.detectStatus")}>
         {done ? (
-          <div className="flex items-center gap-3 text-emerald-400">
-            <CheckCircle2 className="w-5 h-5" />
-            <div>
-              <p className="text-sm font-medium">Detection complete</p>
-              <p className="text-xs text-zinc-400 mt-0.5">
-                Mean confidence: {jobStatus.mean_confidence.toFixed(3)}
-              </p>
+          <div className="space-y-3">
+            <div className="flex items-center gap-3 text-emerald-400">
+              <CheckCircle2 className="w-5 h-5" />
+              <div>
+                <p className="text-sm font-medium">Detection complete</p>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Mean confidence: {jobStatus.mean_confidence.toFixed(3)}
+                </p>
+              </div>
+            </div>
+
+            {/* Blinks — detected from this same pass: both eyes lose their pupil
+                together while the lid is down. */}
+            <div className="border-t border-zinc-800 pt-3">
+              {jobStatus.blinks ? (
+                <>
+                  <div className="flex items-center gap-2 text-xs text-zinc-300">
+                    <Eye className="w-3.5 h-3.5 text-zinc-500" />
+                    <span className="font-medium">{jobStatus.blinks.n_blinks} blinks</span>
+                    <span className="text-zinc-500">
+                      {jobStatus.blinks.blinks_per_min}/min · median{" "}
+                      {jobStatus.blinks.median_duration_ms.toFixed(0)} ms
+                    </span>
+                    <button
+                      onClick={handleDetectBlinks}
+                      disabled={blinking}
+                      title="Re-run blink detection on the stored pupils"
+                      className="ml-auto text-[11px] text-zinc-500 hover:text-zinc-300
+                                 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      {blinking ? "Detecting…" : "Re-detect"}
+                    </button>
+                  </div>
+                  {!jobStatus.blinks.reliable && (
+                    <p className="text-[11px] text-amber-400/90 mt-1.5 leading-snug">
+                      Only {(jobStatus.blinks.detection_quality * 100).toFixed(0)}% of frames had a
+                      trackable eye — with tracking this poor the blink count is not trustworthy.
+                      Improve the detector settings and re-run.
+                    </p>
+                  )}
+                  <p className="text-[10px] text-zinc-600 mt-1">
+                    blinks.csv is written next to pupils.csv and offered in Export.
+                  </p>
+                </>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <p className="text-xs text-zinc-500">
+                    No blinks detected yet for these pupils.
+                  </p>
+                  <button
+                    onClick={handleDetectBlinks}
+                    disabled={blinking}
+                    className="ml-auto flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px]
+                               bg-zinc-800 text-zinc-200 hover:bg-zinc-700 transition-colors
+                               disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    {blinking ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Eye className="w-3 h-3" />}
+                    Detect blinks
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         ) : running ? (
