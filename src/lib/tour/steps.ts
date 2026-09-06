@@ -31,6 +31,12 @@ export interface TourStep {
   page?: Page;
   /** Element to spotlight. Without one the step is shown centred. */
   anchor?: AnchorId;
+  /**
+   * A second element folded into the spotlight while it is on screen — the menu
+   * the anchored control opens. Without it the tooltip sits right below the
+   * closed control and covers the menu the moment the user opens it.
+   */
+  expand?: AnchorId;
   title: string;
   body: string;
   /** Numbered list rendered under `body`. */
@@ -462,6 +468,7 @@ const gazeChapter: TourChapter = {
       id: "source",
       page: "gaze",
       anchor: "gaze.sourceSelector",
+      expand: "gaze.sourceMenu",
       placement: "bottom",
       title: "Which gaze to work from",
       body:

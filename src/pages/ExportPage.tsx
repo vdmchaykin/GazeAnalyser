@@ -164,7 +164,6 @@ export function ExportPage({ onNavigate }: { onNavigate?: (page: NavPage, record
         recordings={recordings}
         projects={projects}
         loading={loading}
-        recordingsSection="all"
         selectedRecordingId={source?.kind === "recording" ? source.id : null}
         selectedProjectId={source?.kind === "project" ? source.id : null}
         onSelect={(rec) => select({ kind: "recording", id: rec.id, label: rec.name })}

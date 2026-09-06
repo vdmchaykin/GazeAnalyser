@@ -1,4 +1,4 @@
-# PupilLabsReplacer
+# Gaze Analyser
 
 A desktop application for processing and analysing eye-tracking recordings from Pupil Labs devices. Built with Tauri 2 (Rust), React + TypeScript (Vite), and a Python FastAPI backend.
 
@@ -102,6 +102,7 @@ with the frontend.
 # 1. Freeze the backend (writes backend/dist/gazeanalyzer-backend/)
 cd backend
 source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install pyinstaller         # build-time only, not in requirements.txt
 pyinstaller --clean --noconfirm gazeanalyzer-backend.spec
 cd ..
 
@@ -117,10 +118,48 @@ bundled resource and the Rust shell starts it from there. The shell picks a free
 port, passes it to the backend and injects it into the webview, so nothing is
 pinned to 8765 outside development.
 
-PyInstaller cannot cross-compile: the Windows installer has to be built on
-Windows, with its own venv and the same two commands. The frozen backend is a
-console program, so check on the first Windows build whether a console window
-flashes up behind the app; if it does, that is the thing to fix in the spec.
+### Building on Windows
+
+PyInstaller cannot cross-compile, so the Windows installer has to be produced on
+Windows — the same two commands, in a Windows checkout with its own venv.
+
+Besides Node and Python 3.12 (the pinned torch wheels are cp312), the machine
+needs the Rust MSVC toolchain from [rustup](https://rustup.rs) and the **Visual
+Studio Build Tools** with "Desktop development with C++" — Rust links through
+MSVC. WebView2 ships with Windows 11 and current Windows 10; the generated
+installer bootstraps it otherwise.
+
+The backend is a console program, but the shell starts it with `CREATE_NO_WINDOW`
+(and with its stdin piped, which is what `--exit-with-parent` listens on), so no
+console window appears.
+
+Tauri's own Windows bundlers are not usable here: NSIS and WiX both fail above a
+~2 GB payload ([tauri#7372](https://github.com/tauri-apps/tauri/issues/7372),
+open upstream), and the CUDA build of torch puts the app at roughly 5 GB. The
+installer is therefore built with [Inno Setup](https://jrsoftware.org/isinfo.php)
+(6.3+), which carries up to 4.2 GB of compressed data in a single setup.exe:
+
+```powershell
+cd backend
+venv\Scripts\activate
+pip install pyinstaller
+pyinstaller --clean --noconfirm gazeanalyzer-backend.spec
+cd ..
+
+npm run tauri build -- --no-bundle
+iscc installers\windows\GazeAnalyzer.iss
+```
+
+`--no-bundle` skips the bundlers that would fail; the build still writes the
+whole tree to `src-tauri\target\release\` — the exe with the `backend\`
+resource directory beside it — because resources are copied there by the build
+script, not by the bundler. That is exactly the layout the app expects at
+runtime, so the same tree also works as a portable zip if you ever want one.
+
+The installer lands in `installers\windows\Output\`. It installs WebView2 if
+the machine lacks it, and needs an NVIDIA driver on the target machine for the
+GPU path — without one torch silently falls back to the CPU, which takes hours
+per recording.
 
 ## Where the data lives
 

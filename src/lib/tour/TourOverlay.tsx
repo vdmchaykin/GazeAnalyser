@@ -54,6 +54,20 @@ function useAnchorBox(anchor?: AnchorId): Box | null {
   return box;
 }
 
+/** The spotlight over a control and the menu it opened: one hole around both,
+ *  so the menu stays lit and clickable and the tooltip is pushed clear of it. */
+function unionBox(a: Box | null, b: Box | null): Box | null {
+  if (!a || !b) return a ?? b;
+  const top = Math.min(a.top, b.top);
+  const left = Math.min(a.left, b.left);
+  return {
+    top,
+    left,
+    width: Math.max(a.left + a.width, b.left + b.width) - left,
+    height: Math.max(a.top + a.height, b.top + b.height) - top,
+  };
+}
+
 function fits(top: number, left: number, w: number, h: number) {
   return top >= EDGE && left >= EDGE &&
     top + h <= window.innerHeight - EDGE && left + w <= window.innerWidth - EDGE;
@@ -148,7 +162,7 @@ function Dimmer({ box, blocking, dim }: { box: Box | null; blocking: boolean; di
 export function TourOverlay() {
   const tour = useTour();
   const { step, chapter } = tour;
-  const box = useAnchorBox(step?.anchor);
+  const box = unionBox(useAnchorBox(step?.anchor), useAnchorBox(step?.expand));
   const tooltipRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: TOOLTIP_WIDTH, h: 180 });
 

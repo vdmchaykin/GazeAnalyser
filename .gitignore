@@ -34,6 +34,9 @@ backend/app/vendor/checkpoints/
 backend/build/
 backend/dist/
 
+# Windows installer built by Inno Setup
+installers/windows/Output/
+
 # Model weights, wherever they land
 *.pth
 

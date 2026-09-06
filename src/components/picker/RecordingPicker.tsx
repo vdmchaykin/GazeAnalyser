@@ -86,8 +86,6 @@ export interface RecordingPickerProps {
   onSelect: (rec: RecordingMeta) => void;
   /** When given, a project row is selectable too; otherwise it only expands. */
   onSelectProject?: (project: ProjectRef) => void;
-  /** "all" also lists project recordings in the bottom section (Export). */
-  recordingsSection?: "ungrouped" | "all";
   /** Expand the project holding a recording this matches — used to keep the
       tour's demo recording reachable without the user opening its project. */
   autoExpand?: (rec: RecordingMeta) => boolean;
@@ -109,7 +107,6 @@ export function RecordingPicker({
   selectedProjectId = null,
   onSelect,
   onSelectProject,
-  recordingsSection = "ungrouped",
   autoExpand,
   rowProps,
   emptyIcon: EmptyIcon = Film,
@@ -156,7 +153,6 @@ export function RecordingPicker({
     });
   };
 
-  const listed = recordingsSection === "all" ? recordings : loose;
   const nothingAtAll = recordings.length === 0 && groups.length === 0;
 
   return (
@@ -209,10 +205,10 @@ export function RecordingPicker({
               </>
             )}
 
-            {listed.length > 0 && (
+            {loose.length > 0 && (
               <>
                 <SectionLabel>Recordings</SectionLabel>
-                {listed.map((rec) => (
+                {loose.map((rec) => (
                   <RecordingRow
                     key={rec.id}
                     rec={rec}

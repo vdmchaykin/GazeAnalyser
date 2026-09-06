@@ -159,6 +159,7 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
           available={analysisState.available_sources}
           onChange={handleSourceChange}
           disabled={stateLoading || switchingSource}
+          menuProps={tourAnchor("gaze.sourceMenu")}
         />
         </span>
 

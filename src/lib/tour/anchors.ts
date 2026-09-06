@@ -54,6 +54,7 @@ export type AnchorId =
   | "gaze.recordingList"
   | "gaze.demoRecording"
   | "gaze.sourceSelector"
+  | "gaze.sourceMenu"
   | "gaze.stepIndicator"
   | "gaze.stepDetect"
   | "gaze.stepCalibrate"
