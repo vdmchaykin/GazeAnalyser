@@ -25,8 +25,46 @@ except ImportError:
 
 router = APIRouter(prefix="/api/recordings/{recording_id}/aoi", tags=["aoi"])
 
-# A4 at 96 dpi
+# A4 at 96 dpi, portrait. The sheet may also be printed landscape, so the warp
+# canvas is chosen per annotation — see :func:`output_size`. Everything stored
+# downstream (areas, markers, gaze) is in normalized page coords, so orientation
+# only decides the pixel canvas a background is rendered into and the aspect the
+# UI draws it at.
 OUTPUT_W, OUTPUT_H = 794, 1123
+PORTRAIT, LANDSCAPE = "portrait", "landscape"
+# What a request asks for. AUTO means "read it off the markers" — the warp then
+# reports which of the two it resolved to, and that resolved value is what gets
+# stored and what every renderer uses.
+AUTO = "auto"
+
+
+def output_size(orientation: Optional[str]) -> tuple:
+    """``(w, h)`` of the warp canvas for a sheet orientation (default portrait)."""
+    return (OUTPUT_H, OUTPUT_W) if orientation == LANDSCAPE else (OUTPUT_W, OUTPUT_H)
+
+
+def _quad_orientation(corners: np.ndarray) -> str:
+    """Portrait or landscape, read off the marker quad [TL, TR, BR, BL].
+
+    Compares the mean length of the two horizontal edges against the two vertical
+    ones. The quad is a perspective image of the sheet, so the comparison is not
+    exact — but foreshortening would have to be extreme before the shorter side of
+    the page measures longer, and an uploaded flat scan has none at all. The user
+    can always override the result.
+    """
+    tl, tr, br, bl = [np.asarray(c, dtype=np.float64) for c in corners]
+    width = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
+    height = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2
+    return LANDSCAPE if width > height else PORTRAIT
+
+
+def resolve_orientation(requested: Optional[str], corners: Optional[np.ndarray]) -> str:
+    """The orientation a warp will actually use, resolving AUTO against the quad."""
+    if requested in (PORTRAIT, LANDSCAPE):
+        return requested
+    if corners is None:
+        return PORTRAIT
+    return _quad_orientation(corners)
 
 _SEGMENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 # Project ids are uuid4 strings; the pattern is a path-traversal guard.
@@ -329,11 +367,13 @@ def _outer_corner(corners: np.ndarray, paper_center: np.ndarray) -> np.ndarray:
 
 class DetectFrameRequest(BaseModel):
     timestamp_s: float
+    orientation: str = AUTO
 
 
 class DetectImageRequest(BaseModel):
     image_b64: str
     segment_id: str = "general"
+    orientation: str = AUTO
 
 
 class TagInfo(BaseModel):
@@ -350,7 +390,12 @@ class AoiStateBody(BaseModel):
     reference_image_b64: Optional[str] = None        # warp from an uploaded reference image
     using_reference: bool = False                    # whether the reference image is active
     tag_count: Optional[int] = None
+    orientation: str = PORTRAIT                      # resolved layout every renderer draws at
+    orientation_mode: str = AUTO                     # what the editor asks for: auto/portrait/landscape
     selected_tags: Optional[List[TagInfo]] = None    # tags defining the surface (for surface_positions.csv)
+    # Tags picked on the uploaded reference image, in that image's pixels. Kept so
+    # the reference background can be re-warped when the orientation changes.
+    reference_tags: Optional[List[TagInfo]] = None
     # {tag_id: [[u,v]×4]} in normalized page coords, derived from selected_tags at
     # save time. Stored because a shared annotation is used by recordings whose
     # frames never saw these tags — see _build_registry.
@@ -366,8 +411,22 @@ class SegmentsManifest(BaseModel):
     custom_segments: List[CustomSegment] = []
 
 
+def _detect_tags(frame: np.ndarray) -> List[TagInfo]:
+    """Every AprilTag in a BGR frame, as the warp wants them (raw coordinates)."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    with TagDetector() as detector:
+        detections = detector.detect(gray)
+    return [
+        TagInfo(tag_id=int(d.tag_id),
+                center=[float(d.center[0]), float(d.center[1])],
+                corners=d.corners.tolist())
+        for d in detections
+    ]
+
+
 def _detect_and_warp(frame: np.ndarray, timestamp_s: float,
-                     folder_path: Optional[str] = None) -> dict:
+                     folder_path: Optional[str] = None,
+                     orientation: str = AUTO) -> dict:
     """Run AprilTag detection on a BGR frame and auto-warp using all detected tags.
 
     Shared by the video-frame and uploaded-image entry points so both return the
@@ -408,7 +467,9 @@ def _detect_and_warp(frame: np.ndarray, timestamp_s: float,
             corners=det.corners.tolist(),
         ))
 
-    warped_b64 = _warp_frame(frame, warp_tags, folder_path) if len(warp_tags) >= 3 else None
+    warped_b64, resolved = (_warp_frame(frame, warp_tags, folder_path, orientation)
+                            if len(warp_tags) >= 3
+                            else (None, resolve_orientation(orientation, None)))
 
     _, ann_buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
     frame_b64 = base64.b64encode(ann_buf).decode()
@@ -422,6 +483,7 @@ def _detect_and_warp(frame: np.ndarray, timestamp_s: float,
         "success": warped_b64 is not None,
         "frame_width": frame.shape[1],
         "frame_height": frame.shape[0],
+        "orientation": resolved,
     }
 
 
@@ -444,7 +506,7 @@ async def detect_frame(recording_id: str, req: DetectFrameRequest):
     finally:
         cap.release()
 
-    return _detect_and_warp(frame, req.timestamp_s, rec["folder_path"])
+    return _detect_and_warp(frame, req.timestamp_s, rec["folder_path"], req.orientation)
 
 
 @router.post("/detect-image")
@@ -472,7 +534,7 @@ async def detect_image(recording_id: str, req: DetectImageRequest):
     cv2.imwrite(str(_upload_source_path(adir, req.segment_id)), frame)
 
     # timestamp_s = -1 signals an uploaded source rather than a video position
-    return _detect_and_warp(frame, -1.0)
+    return _detect_and_warp(frame, -1.0, None, req.orientation)
 
 
 @router.get("/state")
@@ -481,8 +543,8 @@ async def get_state(recording_id: str):
     adir = _aoi_dir(rec["folder_path"])
     state_file = adir / "state.json"
     if not state_file.exists():
-        return {"areas": [], "reference_timestamp_s": None, "warped_image_b64": None, "tag_count": None}
-    return json.loads(state_file.read_text())
+        return dict(EMPTY_STATE)
+    return {**EMPTY_STATE, **json.loads(state_file.read_text())}
 
 
 @router.post("/state")
@@ -530,6 +592,7 @@ def _check_segment_id(segment_id: str) -> str:
 
 EMPTY_STATE = {
     "areas": [], "reference_timestamp_s": None, "warped_image_b64": None, "tag_count": None,
+    "orientation": PORTRAIT, "orientation_mode": AUTO,
 }
 
 
@@ -789,6 +852,7 @@ class WarpSelectionRequest(BaseModel):
     selected_tags: List[TagInfo]
     source: str = "video"  # "video" reads the scene frame; "upload" reads the segment's upload source
     segment_id: str = "general"
+    orientation: str = AUTO
 
 
 def _surface_corners_from_tags(
@@ -840,7 +904,8 @@ def _surface_corners_from_tags(
     return np.array(src_pts, dtype=np.float32)
 
 
-def _warp_from_raw(frame: np.ndarray, H: np.ndarray, folder_path: str) -> np.ndarray:
+def _warp_from_raw(frame: np.ndarray, H: np.ndarray, folder_path: str,
+                   out_w: int = OUTPUT_W, out_h: int = OUTPUT_H) -> np.ndarray:
     """Sample the page view straight out of the RAW frame, in one resampling.
 
     `cv2.undistort` keeps the original camera matrix, so on a lens as wide as the
@@ -855,20 +920,25 @@ def _warp_from_raw(frame: np.ndarray, H: np.ndarray, folder_path: str) -> np.nda
     unchanged — the page geometry is still defined by undistorted tag corners —
     only the sampling avoids the intermediate crop."""
     Hi = np.linalg.inv(H)
-    yy, xx = np.mgrid[0:OUTPUT_H, 0:OUTPUT_W].astype(np.float32)
+    yy, xx = np.mgrid[0:out_h, 0:out_w].astype(np.float32)
     hom = np.stack([xx.ravel(), yy.ravel(), np.ones(xx.size, dtype=np.float32)])
     ideal = Hi @ hom
     ideal = (ideal[:2] / ideal[2]).T
     raw = distort_points(folder_path, ideal).astype(np.float32)
     return cv2.remap(
-        frame, raw[:, 0].reshape(OUTPUT_H, OUTPUT_W), raw[:, 1].reshape(OUTPUT_H, OUTPUT_W),
+        frame, raw[:, 0].reshape(out_h, out_w), raw[:, 1].reshape(out_h, out_w),
         cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
     )
 
 
 def _warp_frame(frame: np.ndarray, tags: List[TagInfo],
-                folder_path: Optional[str] = None) -> Optional[str]:
-    """Compute perspective warp from a list of tag infos; returns base64 JPEG or None.
+                folder_path: Optional[str] = None,
+                orientation: str = AUTO) -> tuple:
+    """Perspective-warp the page out of a frame: ``(base64 JPEG | None, orientation)``.
+
+    The second element is the orientation actually used — the requested one, or
+    the one read off the marker quad when AUTO was asked for. Callers hand it back
+    to the client so what is stored matches the pixels that were produced.
 
     For a scene-video frame (`folder_path` given) the tag corners are undistorted
     first, so this background lives in the same undistorted page geometry the gaze
@@ -880,22 +950,28 @@ def _warp_frame(frame: np.ndarray, tags: List[TagInfo],
 
     src_pts = _surface_corners_from_tags(tags, frame.shape[1], frame.shape[0])
     if src_pts is None:
-        return None
+        return None, resolve_orientation(orientation, None)
 
-    dst_pts = np.array([[0, 0], [OUTPUT_W, 0], [OUTPUT_W, OUTPUT_H], [0, OUTPUT_H]], dtype=np.float32)
+    resolved = resolve_orientation(orientation, src_pts)
+    out_w, out_h = output_size(resolved)
+    dst_pts = np.array([[0, 0], [out_w, 0], [out_w, out_h], [0, out_h]], dtype=np.float32)
     H, _ = cv2.findHomography(src_pts, dst_pts, method=0)
     if H is None:
-        return None
-    warped = (_warp_from_raw(frame, H, folder_path) if kd is not None
-              else cv2.warpPerspective(frame, H, (OUTPUT_W, OUTPUT_H)))
+        return None, resolved
+    warped = (_warp_from_raw(frame, H, folder_path, out_w, out_h) if kd is not None
+              else cv2.warpPerspective(frame, H, (out_w, out_h)))
     _, buf = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    return base64.b64encode(buf).decode()
+    return base64.b64encode(buf).decode(), resolved
 
 
 @router.post("/warp-from-selection")
 async def warp_from_selection(recording_id: str, req: WarpSelectionRequest):
-    if len(req.selected_tags) < 3:
-        return {"warped_image_b64": None, "success": False}
+    # An upload may come with no tags: a state saved before the reference tags were
+    # kept still has the source image cached, so they are re-detected below. Every
+    # other caller has to say which tags define the surface.
+    if len(req.selected_tags) < 3 and req.source != "upload":
+        return {"warped_image_b64": None, "success": False,
+                "orientation": resolve_orientation(req.orientation, None)}
 
     rec = await _get_recording(recording_id)
 
@@ -924,10 +1000,19 @@ async def warp_from_selection(recording_id: str, req: WarpSelectionRequest):
         if not ok:
             raise HTTPException(status_code=400, detail="Could not read frame")
 
+    tags = list(req.selected_tags)
+    if len(tags) < 3:
+        tags = _detect_tags(frame)
+        if len(tags) < 3:
+            return {"warped_image_b64": None, "success": False,
+                    "orientation": resolve_orientation(req.orientation, None)}
+
     # Only a scene frame carries our lens distortion; an uploaded image does not.
-    warped_b64 = _warp_frame(frame, req.selected_tags,
-                             None if req.source == "upload" else rec["folder_path"])
-    return {"warped_image_b64": warped_b64, "success": warped_b64 is not None}
+    warped_b64, resolved = _warp_frame(frame, tags,
+                                       None if req.source == "upload" else rec["folder_path"],
+                                       req.orientation)
+    return {"warped_image_b64": warped_b64, "success": warped_b64 is not None,
+            "orientation": resolved}
 
 
 # ─── Surface positions (Pupil-compatible surface_positions.csv) ───────────────
@@ -970,6 +1055,8 @@ def _build_surface_registry(
     corners = _surface_corners_from_tags(selected_tags, frame_w, frame_h)
     if corners is None:
         return None
+    # Any canvas size gives the same registry — the mapped corners are divided by
+    # it again below — so the sheet orientation does not enter here.
     dst_pts = np.array([[0, 0], [OUTPUT_W, 0], [OUTPUT_W, OUTPUT_H], [0, OUTPUT_H]], dtype=np.float32)
     H, _ = cv2.findHomography(corners, dst_pts, method=0)  # scene px -> A4 px
     if H is None:
@@ -1340,8 +1427,10 @@ async def start_surface_positions(recording_id: str, segment_id: str = "general"
             detail="No surface defined. Detect 3+ AprilTags on a frame and Save first.",
         )
 
+    state, _ = _resolve_state_scope(rec, segment_id)
+    out_w, out_h = output_size((state or {}).get("orientation"))
     (adir / "surface.json").write_text(json.dumps({
-        "OUTPUT_W": OUTPUT_W, "OUTPUT_H": OUTPUT_H,
+        "OUTPUT_W": out_w, "OUTPUT_H": out_h,
         "segment_id": segment_id, "markers": registry,
         # Marks which geometry the sibling surface_positions.csv was produced with,
         # so gaze re-projection never reuses corners fitted without distortion

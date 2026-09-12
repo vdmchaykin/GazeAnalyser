@@ -4,15 +4,15 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
 import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
 import { tourAnchor } from "@/lib/tour/anchors";
+import { asOrientation, paperSize, type PaperOrientation, type PaperSize } from "@/lib/paper";
 import { isDemoRecording } from "@/lib/tour/demo";
 import { GazeSourcePicker } from "@/components/gaze/GazeSourcePicker";
 import { GazeOffsetPanel, type PaperPreview } from "@/components/gaze/GazeOffsetPanel";
 import type { RecordingMeta, RecordingEvent, GazePrediction, Fixation, GazeSource } from "@/types";
 
-// Surface (warped paper) canvas resolution — shared with AoI / Surface Map so
-// normalized surface coords (0..1) map the same way everywhere.
-const PAPER_W = 794;
-const PAPER_H = 1123;
+// The surface (warped paper) canvas resolution comes from the annotation's sheet
+// orientation — shared with AoI / Surface Map so normalized surface coords (0..1)
+// map the same way everywhere.
 
 type Mode = "heatmap" | "aoi" | "scanpath";
 type AoiMetric = "dwell" | "count";
@@ -120,7 +120,8 @@ function shapeCentroid(s: AoiShape): [number, number] {
   return [s.x + s.w / 2, s.y + s.h / 2];
 }
 
-function shapePath(ctx: CanvasRenderingContext2D, s: AoiShape) {
+function shapePath(ctx: CanvasRenderingContext2D, s: AoiShape, paper: PaperSize) {
+  const { w: PAPER_W, h: PAPER_H } = paper;
   ctx.beginPath();
   if (s.kind === "rect") {
     ctx.rect(s.x * PAPER_W, s.y * PAPER_H, s.w * PAPER_W, s.h * PAPER_H);
@@ -183,8 +184,9 @@ function reaggregateFixations(
 
 // heatmap.js-style density: accumulate soft radial blobs into a shadow buffer,
 // then colorize by intensity relative to the busiest pixel (→ 0..100% colorbar).
-function drawHeatmap(ctx: CanvasRenderingContext2D, pts: GazePrediction[], radius: number) {
+function drawHeatmap(ctx: CanvasRenderingContext2D, pts: GazePrediction[], radius: number, paper: PaperSize) {
   if (!pts.length) return;
+  const { w: PAPER_W, h: PAPER_H } = paper;
   const shadow = document.createElement("canvas");
   shadow.width = PAPER_W; shadow.height = PAPER_H;
   const sctx = shadow.getContext("2d");
@@ -223,7 +225,9 @@ function drawHeatmap(ctx: CanvasRenderingContext2D, pts: GazePrediction[], radiu
 
 interface AoiValue { area: AoiArea; dwell: number; count: number; }
 
-function drawAoi(ctx: CanvasRenderingContext2D, values: AoiValue[], metric: AoiMetric, max: number) {
+function drawAoi(ctx: CanvasRenderingContext2D, values: AoiValue[], metric: AoiMetric, max: number,
+                 paper: PaperSize) {
+  const { w: PAPER_W, h: PAPER_H } = paper;
   const lut = getPalette();
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -233,7 +237,7 @@ function drawAoi(ctx: CanvasRenderingContext2D, values: AoiValue[], metric: AoiM
     const t = Math.max(0, Math.min(255, Math.round((v / max) * 255)));
     const r = lut[t * 4], g = lut[t * 4 + 1], b = lut[t * 4 + 2];
 
-    shapePath(ctx, area.shape);
+    shapePath(ctx, area.shape, paper);
     ctx.fillStyle = `rgba(${r},${g},${b},0.6)`;
     ctx.fill();
     ctx.lineWidth = 2;
@@ -252,8 +256,9 @@ function drawAoi(ctx: CanvasRenderingContext2D, values: AoiValue[], metric: AoiM
   }
 }
 
-function drawScanpath(ctx: CanvasRenderingContext2D, fixs: Fixation[]) {
+function drawScanpath(ctx: CanvasRenderingContext2D, fixs: Fixation[], paper: PaperSize) {
   if (!fixs.length) return;
+  const { w: PAPER_W, h: PAPER_H } = paper;
   const pt = (f: Fixation): [number, number] => [f.norm_x! * PAPER_W, f.norm_y! * PAPER_H];
 
   // Saccade lines under the circles.
@@ -288,8 +293,9 @@ function drawScanpath(ctx: CanvasRenderingContext2D, fixs: Fixation[]) {
 // Compose the downloadable bitmap: the surface canvas plus, for heatmap / AoI, a
 // labelled colorbar on a white margin, so the PNG is a self-contained figure.
 function buildExportCanvas(
-  source: HTMLCanvasElement, mode: Mode, metric: AoiMetric, max: number,
+  source: HTMLCanvasElement, mode: Mode, metric: AoiMetric, max: number, paper: PaperSize,
 ): HTMLCanvasElement {
+  const { w: PAPER_W, h: PAPER_H } = paper;
   const hasBar = mode !== "scanpath";
   const margin = hasBar ? 150 : 0;
   const out = document.createElement("canvas");
@@ -366,6 +372,8 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
   const [activeSegId, setActiveSegId] = useState("general");
   const [areas, setAreas] = useState<AoiArea[]>([]);
   const [paperImg, setPaperImg] = useState<HTMLImageElement | null>(null);
+  const [orientation, setOrientation] = useState<PaperOrientation>("portrait");
+  const paper = paperSize(orientation);
 
   const [mode, setMode] = useState<Mode>("heatmap");
   const [aoiMetric, setAoiMetric] = useState<AoiMetric>("dwell");
@@ -392,14 +400,25 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
 
   const loadAoiState = async (recId: string, segId: string) => {
     try {
-      const state = await api.get<{ areas: AoiArea[]; warped_image_b64: string | null }>(
+      const state = await api.get<{
+        areas: AoiArea[]; warped_image_b64: string | null; orientation?: string | null;
+      }>(
         `/api/recordings/${recId}/aoi/${segId}/state`,
       );
       setAreas(state.areas ?? []);
+      setOrientation(asOrientation(state.orientation));
       const b64 = state.warped_image_b64 ?? null;
       if (b64) {
         const img = new Image();
-        img.onload = () => setPaperImg(img);
+        img.onload = () => {
+          setPaperImg(img);
+          // The background is the ground truth for the geometry: it was warped
+          // into a canvas of one orientation, and drawing it at the other
+          // squeezes the page. The stored flag only answers for an empty segment.
+          if (img.naturalWidth && img.naturalHeight) {
+            setOrientation(img.naturalWidth > img.naturalHeight ? "landscape" : "portrait");
+          }
+        };
         img.src = `data:image/jpeg;base64,${b64}`;
       } else {
         setPaperImg(null);
@@ -407,6 +426,7 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
     } catch {
       setAreas([]);
       setPaperImg(null);
+      setOrientation("portrait");
     }
   };
 
@@ -537,14 +557,14 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.clearRect(0, 0, PAPER_W, PAPER_H);
-    if (paperImg) ctx.drawImage(paperImg, 0, 0, PAPER_W, PAPER_H);
-    else { ctx.fillStyle = "#e5e5e5"; ctx.fillRect(0, 0, PAPER_W, PAPER_H); }
+    ctx.clearRect(0, 0, paper.w, paper.h);
+    if (paperImg) ctx.drawImage(paperImg, 0, 0, paper.w, paper.h);
+    else { ctx.fillStyle = "#e5e5e5"; ctx.fillRect(0, 0, paper.w, paper.h); }
 
-    if (mode === "heatmap") drawHeatmap(ctx, gazePts, radius);
-    else if (mode === "aoi") drawAoi(ctx, aoiValues, aoiMetric, aoiMax);
-    else if (mode === "scanpath") drawScanpath(ctx, segFix);
-  }, [canvas, mode, paperImg, gazePts, segFix, aoiValues, aoiMetric, aoiMax, radius]);
+    if (mode === "heatmap") drawHeatmap(ctx, gazePts, radius, paper);
+    else if (mode === "aoi") drawAoi(ctx, aoiValues, aoiMetric, aoiMax, paper);
+    else if (mode === "scanpath") drawScanpath(ctx, segFix, paper);
+  }, [canvas, mode, paperImg, gazePts, segFix, aoiValues, aoiMetric, aoiMax, radius, paper.w, paper.h]);
 
   // Save the composited figure (surface + overlay + colorbar) as a PNG. Like the
   // CSV export, the Tauri webview can't download directly, so a native save
@@ -553,7 +573,7 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
     if (!canvas || !recording) return;
     setSaving(true);
     try {
-      const out = buildExportCanvas(canvas, mode, aoiMetric, aoiMax);
+      const out = buildExportCanvas(canvas, mode, aoiMetric, aoiMax, paper);
       const b64 = out.toDataURL("image/png").split(",")[1];
       const safe = `${recording.name}_${mode}_${activeSegId}`.replace(/[^a-zA-Z0-9_-]+/g, "_");
       const dest = await save({
@@ -719,16 +739,19 @@ export function VisualisationPage({ initialRecording }: { initialRecording?: Rec
           </div>
         ) : (
           <>
+            {/* The canvas sizes itself from its width/height attributes: capping
+                both axes fits either orientation. A ratio on the box with an
+                explicit height would stretch a landscape sheet whenever the width
+                cap bit first. */}
             <div
-              className="relative border border-zinc-700 rounded shadow-2xl"
-              style={{ aspectRatio: `${PAPER_W}/${PAPER_H}`, maxHeight: "100%", maxWidth: "100%", height: "100%" }}
+              className="relative h-full flex items-center justify-center"
               {...tourAnchor("vis.canvas")}
             >
               <canvas
                 ref={setCanvas}
-                width={PAPER_W}
-                height={PAPER_H}
-                className="w-full h-full rounded"
+                width={paper.w}
+                height={paper.h}
+                className="block max-h-full max-w-full rounded border border-zinc-700 shadow-2xl"
               />
               {emptyMsg && (
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none p-6">

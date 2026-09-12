@@ -102,6 +102,7 @@ export type AnchorId =
   | "aoi.addArea"
   | "aoi.tools"
   | "aoi.canvas"
+  | "aoi.orientation"
   | "aoi.referenceMenu"
   | "aoi.uploadReference"
   | "aoi.backgroundSwitch"

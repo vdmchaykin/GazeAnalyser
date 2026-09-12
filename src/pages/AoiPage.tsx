@@ -11,6 +11,10 @@ import { api } from "@/lib/api";
 import { confirmDialog } from "@/components/ConfirmDialog";
 import { RecordingPicker } from "@/components/picker/RecordingPicker";
 import { tourAnchor } from "@/lib/tour/anchors";
+import {
+  asOrientation, asOrientationMode, paperSize,
+  type OrientationMode, type PaperOrientation, type PaperSize,
+} from "@/lib/paper";
 import { emitTourEvent } from "@/lib/tour/events";
 import type { ProjectRef, RecordingMeta, RecordingEvent } from "@/types";
 
@@ -87,7 +91,13 @@ interface SegmentData {
   refTimestamp: number | null;
   areas: AoiArea[];
   tagCount: number | null;
+  /** How the printed sheet is laid out; decides the warp canvas and every aspect ratio. */
+  orientation: PaperOrientation;
+  /** What the warp is asked for — "auto" lets the markers decide `orientation`. */
+  orientationMode: OrientationMode;
   selectedTags: TagInfo[] | null;   // tags defining the surface (for surface_positions.csv)
+  /** Tags picked on the uploaded reference image, kept so it can be re-warped. */
+  referenceTags: TagInfo[] | null;
   /** The surface registry the saved state carries, in normalized page coords.
       Sent back untouched so a state inherited from the project keeps the geometry
       its own frame produced; cleared when tags are picked anew, which is the
@@ -114,6 +124,7 @@ interface DetectResult {
   frame_height: number;
   tags: TagInfo[];
   selected_tags?: TagInfo[];
+  orientation?: PaperOrientation;
 }
 
 const PALETTE = [
@@ -153,7 +164,10 @@ const emptySegmentData = (): SegmentData => ({
   refTimestamp: null,
   areas: [],
   tagCount: null,
+  orientation: "portrait",
+  orientationMode: "auto",
   selectedTags: null,
+  referenceTags: null,
   markers: null,
   scope: "none",
 });
@@ -182,7 +196,10 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
         reference_image_b64?: string | null;
         using_reference?: boolean;
         tag_count: number | null;
+        orientation?: string | null;
+        orientation_mode?: string | null;
         selected_tags?: TagInfo[] | null;
+        reference_tags?: TagInfo[] | null;
         markers?: Record<string, number[][]> | null;
         scope?: AoiScope;
       }>(`${stateBase(target)}/${segmentId}/state`);
@@ -199,7 +216,10 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
           refTimestamp: state.reference_timestamp_s ?? null,
           areas: state.areas ?? [],
           tagCount: state.tag_count ?? null,
+          orientation: asOrientation(state.orientation),
+          orientationMode: asOrientationMode(state.orientation_mode),
           selectedTags: state.selected_tags ?? null,
+          referenceTags: state.reference_tags ?? null,
           markers: state.markers ?? null,
           scope: state.scope ?? "none",
         },
@@ -321,23 +341,107 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
         usingReference: false,
         refTimestamp: result.timestamp_s,
         tagCount: result.tag_count,
+        orientation: asOrientation(result.orientation),
         selectedTags: result.selected_tags ?? null,
+        referenceTags: null,
         markers: null,
       },
     }));
   };
 
   // A crisp reference image was warped into the A4 plane — swap it in as the background.
-  const handleReferenceConfirmed = (warpB64: string) => {
+  const handleReferenceConfirmed = (
+    warpB64: string, tags: TagInfo[], orientation: PaperOrientation,
+  ) => {
     setSegmentData((prev) => ({
       ...prev,
       [activeSegmentId]: {
         ...(prev[activeSegmentId] ?? emptySegmentData()),
         warpedImage: warpB64,
         referenceImage: warpB64,
+        referenceTags: tags,
         usingReference: true,
+        // The upload was warped into the canvas the picker resolved for it; the
+        // video background behind it was warped into the same one.
+        orientation,
       },
     }));
+  };
+
+  /**
+   * Switch what the warp is asked for: auto (read off the markers), or a forced
+   * portrait/landscape.
+   *
+   * The backgrounds on screen were warped into the canvas of the previous answer,
+   * so they are re-warped from the tags that produced them — the video frame from
+   * `selectedTags` at the stored timestamp, the reference from the upload source
+   * cached per segment. The warp reports which orientation it resolved to, and
+   * that is what the editor and every later page draw at. A background whose tags
+   * are not known (an older state) keeps its pixels; it reads stretched until it
+   * is detected again.
+   */
+  const handleOrientationChange = async (mode: OrientationMode) => {
+    if (!ctx) return;
+    const segId = activeSegmentId;
+    const data = segmentData[segId];
+    // Re-picking "auto" is a re-check, not a no-op: a state saved before the sheet
+    // orientation existed carries a background warped the old, always-portrait way.
+    if (!data || (data.orientationMode === mode && mode !== "auto")) return;
+
+    setSegmentData((prev) => ({
+      ...prev,
+      [segId]: { ...(prev[segId] ?? emptySegmentData()), orientationMode: mode },
+    }));
+
+    // An upload with no recorded tags is still re-warpable: the backend re-detects
+    // them on the source image it cached for the segment.
+    const rewarp = async (tags: TagInfo[] | null, source: "video" | "upload") => {
+      if (source === "video" && (!tags || tags.length < 3)) return null;
+      try {
+        return await api.post<{
+          warped_image_b64: string | null; success: boolean; orientation?: string;
+        }>(
+          `/api/recordings/${ctx.source.id}/aoi/warp-from-selection`,
+          {
+            timestamp_s: data.refTimestamp ?? 0,
+            selected_tags: tags ?? [],
+            source,
+            segment_id: segId,
+            orientation: mode,
+          },
+        );
+      } catch {
+        return null;
+      }
+    };
+
+    const [video, reference] = await Promise.all([
+      rewarp(data.selectedTags, "video"),
+      data.referenceImage ? rewarp(data.referenceTags, "upload") : Promise.resolve(null),
+    ]);
+    // The active background is the one on screen, so its answer wins.
+    const resolved = data.usingReference
+      ? reference?.orientation ?? video?.orientation
+      : video?.orientation ?? reference?.orientation;
+
+    setSegmentData((prev) => {
+      const d = prev[segId];
+      if (!d || d.orientationMode !== mode) return prev;  // switched again meanwhile
+      const videoWarpedImage = video?.warped_image_b64 ?? d.videoWarpedImage;
+      const referenceImage = reference?.warped_image_b64 ?? d.referenceImage;
+      return {
+        ...prev,
+        [segId]: {
+          ...d,
+          videoWarpedImage,
+          referenceImage,
+          warpedImage: d.usingReference ? referenceImage : videoWarpedImage,
+          // Nothing could be re-warped: follow an explicit choice anyway, so the
+          // canvas at least matches what the next detection will produce.
+          orientation: asOrientation(resolved ?? (mode === "auto" ? d.orientation : mode)),
+        },
+      };
+    });
   };
 
   // Toggle the active background between the video frame and the uploaded reference.
@@ -373,6 +477,7 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
         refTimestamp: null,
         tagCount: null,
         selectedTags: null,
+        referenceTags: null,
         markers: null,
       },
     }));
@@ -390,7 +495,10 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
       reference_image_b64: data.referenceImage,
       using_reference: data.usingReference,
       tag_count: data.tagCount,
+      orientation: data.orientation,
+      orientation_mode: data.orientationMode,
       selected_tags: data.selectedTags,
+      reference_tags: data.referenceTags,
       markers: data.markers,
       // The tags are in this recording's scene pixels; the backend turns them into
       // the page-normalized registry the other recordings use.
@@ -470,6 +578,7 @@ export function AoiPage({ initialRecording }: { initialRecording?: RecordingMeta
       onFrameConfirmed={handleFrameConfirmed}
       onReferenceConfirmed={handleReferenceConfirmed}
       onToggleBackground={handleToggleBackground}
+      onOrientationChange={handleOrientationChange}
       onAreasChange={handleAreasChange}
       onRedetect={handleRedetect}
       onSave={handleSave}
@@ -494,6 +603,7 @@ function AnnotateView({
   onFrameConfirmed,
   onReferenceConfirmed,
   onToggleBackground,
+  onOrientationChange,
   onAreasChange,
   onRedetect,
   onSave,
@@ -510,8 +620,9 @@ function AnnotateView({
   onBack: () => void;
   onChangeSource: (rec: RecordingMeta) => void;
   onFrameConfirmed: (r: DetectResult) => void;
-  onReferenceConfirmed: (warpB64: string) => void;
+  onReferenceConfirmed: (warpB64: string, tags: TagInfo[], orientation: PaperOrientation) => void;
   onToggleBackground: () => void;
+  onOrientationChange: (mode: OrientationMode) => Promise<void>;
   onAreasChange: (areas: AoiArea[]) => void;
   onRedetect: () => void;
   onSave: () => Promise<void>;
@@ -626,7 +737,14 @@ function AnnotateView({
           <Loader2 className="w-6 h-6 animate-spin" />
         </div>
       ) : !activeData.warpedImage ? (
-        <FramePicker recording={recording} segmentId={activeSegmentId} onConfirmed={onFrameConfirmed} />
+        <FramePicker
+          recording={recording}
+          segmentId={activeSegmentId}
+          orientation={activeData.orientation}
+          orientationMode={activeData.orientationMode}
+          onOrientationChange={onOrientationChange}
+          onConfirmed={onFrameConfirmed}
+        />
       ) : (
         <DrawCanvas
           recording={recording}
@@ -635,6 +753,9 @@ function AnnotateView({
           refTimestamp={activeData.refTimestamp}
           hasReference={activeData.referenceImage !== null}
           usingReference={activeData.usingReference}
+          orientation={activeData.orientation}
+          orientationMode={activeData.orientationMode}
+          onOrientationChange={onOrientationChange}
           areas={activeData.areas}
           onAreasChange={onAreasChange}
           onRedetect={onRedetect}
@@ -901,10 +1022,16 @@ function formatTime(sec: number): string {
 function FramePicker({
   recording,
   segmentId,
+  orientation,
+  orientationMode,
+  onOrientationChange,
   onConfirmed,
 }: {
   recording: RecordingMeta;
   segmentId: string;
+  orientation: PaperOrientation;
+  orientationMode: OrientationMode;
+  onOrientationChange: (m: OrientationMode) => Promise<void>;
   onConfirmed: (r: DetectResult) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -975,7 +1102,7 @@ function FramePicker({
     try {
       const res = await api.post<DetectResult>(
         `/api/recordings/${recording.id}/aoi/detect-frame`,
-        { timestamp_s: t },
+        { timestamp_s: t, orientation: orientationMode },
       );
       setResult(res);
     } catch (e) {
@@ -1067,8 +1194,9 @@ function FramePicker({
       {/* Result panel */}
       <div className="w-80 shrink-0 border-l border-zinc-800 flex flex-col overflow-auto bg-zinc-950"
            {...tourAnchor("aoi.detectResult")}>
-        <div className="px-4 py-3 border-b border-zinc-800">
+        <div className="px-4 py-3 border-b border-zinc-800 flex flex-col gap-2">
           <span className="text-xs font-medium text-zinc-400">Detection result</span>
+          <OrientationToggle value={orientationMode} resolved={orientation} onChange={onOrientationChange} />
         </div>
 
         <div className="flex flex-col gap-3 p-4">
@@ -1085,10 +1213,14 @@ function FramePicker({
               recordingId={recording.id}
               segmentId={segmentId}
               result={result}
+              orientationMode={orientationMode}
               source="video"
               confirmLabel="Use this frame"
-              onConfirm={(warp, count, selTags) =>
-                onConfirmed({ ...result, warped_image_b64: warp, success: true, tag_count: count, selected_tags: selTags })
+              onConfirm={(warp, count, selTags, resolved) =>
+                onConfirmed({
+                  ...result, warped_image_b64: warp, success: true,
+                  tag_count: count, selected_tags: selTags, orientation: resolved,
+                })
               }
             />
           ) : !error && (
@@ -1108,6 +1240,7 @@ function TagPicker({
   recordingId,
   segmentId,
   result,
+  orientationMode,
   source,
   confirmLabel,
   onConfirm,
@@ -1115,13 +1248,19 @@ function TagPicker({
   recordingId: string;
   segmentId: string;
   result: DetectResult;
+  orientationMode: OrientationMode;
   source: "video" | "upload";
   confirmLabel: string;
-  onConfirm: (warpB64: string, tagCount: number, selectedTags: TagInfo[]) => void;
+  onConfirm: (
+    warpB64: string, tagCount: number, selectedTags: TagInfo[], orientation: PaperOrientation,
+  ) => void;
 }) {
   // Selection keyed by detection index, not tag_id (IDs can repeat across papers)
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
   const [warpB64, setWarpB64] = useState<string | null>(null);
+  // Which orientation the preview on screen was warped into — the backend's
+  // answer, which under "auto" is what it read off the marker quad.
+  const [resolved, setResolved] = useState<PaperOrientation>(asOrientation(result.orientation));
   const [warpOk, setWarpOk] = useState(false);
   const [recomputing, setRecomputing] = useState(false);
 
@@ -1130,27 +1269,45 @@ function TagPicker({
     setSelectedIndices(new Set(result.tags.map((t) => t.index)));
     setWarpB64(result.warped_image_b64);
     setWarpOk(result.success);
+    setResolved(asOrientation(result.orientation));
   }, [result]);
 
-  const toggleTag = useCallback(async (idx: number) => {
-    const newSel = new Set(selectedIndices);
-    if (newSel.has(idx)) newSel.delete(idx); else newSel.add(idx);
-    setSelectedIndices(newSel);
-
-    const selTags = result.tags.filter((t) => newSel.has(t.index));
+  const recompute = useCallback(async (selTags: TagInfo[]) => {
     if (selTags.length < 3) { setWarpB64(null); setWarpOk(false); return; }
-
     setRecomputing(true);
     try {
-      const res = await api.post<{ warped_image_b64: string | null; success: boolean }>(
+      const res = await api.post<{
+        warped_image_b64: string | null; success: boolean; orientation?: string;
+      }>(
         `/api/recordings/${recordingId}/aoi/warp-from-selection`,
-        { timestamp_s: result.timestamp_s, selected_tags: selTags, source, segment_id: segmentId },
+        {
+          timestamp_s: result.timestamp_s, selected_tags: selTags,
+          source, segment_id: segmentId, orientation: orientationMode,
+        },
       );
       setWarpB64(res.warped_image_b64);
       setWarpOk(res.success);
+      if (res.orientation) setResolved(asOrientation(res.orientation));
     } catch { /* keep current preview */ }
     finally { setRecomputing(false); }
-  }, [result, selectedIndices, recordingId, source, segmentId]);
+  }, [result.timestamp_s, recordingId, source, segmentId, orientationMode]);
+
+  const toggleTag = useCallback((idx: number) => {
+    const newSel = new Set(selectedIndices);
+    if (newSel.has(idx)) newSel.delete(idx); else newSel.add(idx);
+    setSelectedIndices(newSel);
+    void recompute(result.tags.filter((t) => newSel.has(t.index)));
+  }, [result.tags, selectedIndices, recompute]);
+
+  // The preview was warped into the canvas of the orientation it was requested
+  // with, so a switch has to ask for it again — the tags are unchanged.
+  const warpedMode = useRef(orientationMode);
+  useEffect(() => {
+    if (warpedMode.current === orientationMode) return;
+    warpedMode.current = orientationMode;
+    void recompute(result.tags.filter((t) => selectedIndices.has(t.index)));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orientationMode]);
 
   const selCount = selectedIndices.size;
   const tagBadgeClass =
@@ -1232,7 +1389,7 @@ function TagPicker({
       {warpOk && warpB64 && (
         <button
           {...tourAnchor("aoi.confirmFrame")}
-          onClick={() => onConfirm(warpB64, selCount, result.tags.filter((t) => selectedIndices.has(t.index)))}
+          onClick={() => onConfirm(warpB64, selCount, result.tags.filter((t) => selectedIndices.has(t.index)), resolved)}
           disabled={recomputing}
           className="flex items-center justify-center gap-2 px-4 py-2.5
                      bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50
@@ -1251,13 +1408,15 @@ function TagPicker({
 function ReferenceUploadModal({
   recordingId,
   segmentId,
+  orientationMode,
   onClose,
   onConfirmed,
 }: {
   recordingId: string;
   segmentId: string;
   onClose: () => void;
-  onConfirmed: (warpB64: string) => void;
+  orientationMode: OrientationMode;
+  onConfirmed: (warpB64: string, tags: TagInfo[], orientation: PaperOrientation) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadName, setUploadName] = useState<string | null>(null);
@@ -1281,7 +1440,7 @@ function ReferenceUploadModal({
     try {
       const res = await api.post<DetectResult>(
         `/api/recordings/${recordingId}/aoi/detect-image`,
-        { image_b64: dataUrl, segment_id: segmentId },
+        { image_b64: dataUrl, segment_id: segmentId, orientation: orientationMode },
       );
       setResult(res);
     } catch (e) {
@@ -1371,12 +1530,13 @@ function ReferenceUploadModal({
               )}
               {result ? (
                 <TagPicker
+                  orientationMode={orientationMode}
                   recordingId={recordingId}
                   segmentId={segmentId}
                   result={result}
                   source="upload"
                   confirmLabel="Replace background"
-                  onConfirm={(warp) => { onConfirmed(warp); onClose(); }}
+                  onConfirm={(warp, _count, selTags, resolved) => { onConfirmed(warp, selTags, resolved); onClose(); }}
                 />
               ) : !error && (
                 <p className="text-zinc-700 text-xs text-center py-8 px-2">
@@ -1400,6 +1560,9 @@ function DrawCanvas({
   refTimestamp,
   hasReference,
   usingReference,
+  orientation,
+  orientationMode,
+  onOrientationChange,
   areas,
   onAreasChange,
   onRedetect,
@@ -1414,15 +1577,38 @@ function DrawCanvas({
   refTimestamp: number | null;
   hasReference: boolean;
   usingReference: boolean;
+  orientation: PaperOrientation;
+  orientationMode: OrientationMode;
+  onOrientationChange: (m: OrientationMode) => Promise<void>;
   areas: AoiArea[];
   onAreasChange: (areas: AoiArea[]) => void;
   onRedetect: () => void;
-  onReferenceConfirmed: (warpB64: string) => void;
+  onReferenceConfirmed: (warpB64: string, tags: TagInfo[], orientation: PaperOrientation) => void;
   onToggleBackground: () => void;
   onSave: () => Promise<void>;
   /** Names who the save reaches — every recording in the project, or just this one. */
   saveLabel: string;
 }) {
+  const paper = paperSize(orientation);
+  // The largest box of the sheet's ratio that fits the drawing area, measured
+  // because CSS cannot cap both axes of a ratio box on its own.
+  const paperAreaRef = useRef<HTMLDivElement>(null);
+  const [paperBox, setPaperBox] = useState<{ w: number; h: number } | null>(null);
+  useEffect(() => {
+    const el = paperAreaRef.current;
+    if (!el) return;
+    const fit = (w: number, h: number) => {
+      const scale = Math.min(w / paper.w, (h - 16) / paper.h);
+      setPaperBox(scale > 0 ? { w: paper.w * scale, h: paper.h * scale } : null);
+    };
+    const ro = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      fit(width, height);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [paper.w, paper.h]);
+
   const [showUpload, setShowUpload] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1823,8 +2009,11 @@ function DrawCanvas({
             Clear all
           </button>
 
-          {/* Right side: reference image menu */}
-          <div className="ml-auto relative" {...tourAnchor("aoi.referenceMenu")}>
+          {/* Right side: sheet orientation + reference image menu */}
+          <div className="ml-auto" {...tourAnchor("aoi.orientation")}>
+            <OrientationToggle value={orientationMode} resolved={orientation} onChange={onOrientationChange} />
+          </div>
+          <div className="relative" {...tourAnchor("aoi.referenceMenu")}>
             <button
               onClick={() => setMenuOpen((o) => !o)}
               className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded transition-colors cursor-pointer
@@ -1876,10 +2065,16 @@ function DrawCanvas({
         </div>
 
         {/* Paper canvas */}
-        <div className="flex-1 flex items-center justify-center overflow-hidden p-8">
+        <div ref={paperAreaRef} className="flex-1 flex items-center justify-center overflow-hidden p-8">
           <div
             className="relative shadow-2xl overflow-hidden flex-shrink-0"
-            style={{ aspectRatio: "794 / 1123", height: "calc(100% - 16px)" }}
+            // The sheet must keep its exact ratio: the pointer maths and the SVG
+            // overlay read normalized coordinates off this box. A ratio plus an
+            // explicit height does not survive a width cap — a landscape sheet
+            // would silently stretch — so the fitted size is measured instead.
+            style={paperBox
+              ? { width: paperBox.w, height: paperBox.h }
+              : { aspectRatio: `${paper.w} / ${paper.h}`, height: "calc(100% - 16px)", maxWidth: "100%" }}
             {...tourAnchor("aoi.canvas")}
           >
             {warpedImage ? (
@@ -1922,7 +2117,7 @@ function DrawCanvas({
               onMouseLeave={() => { setDrawStart(null); setLiveBox(null); setDragging(null); setOverShape(false); }}
             />
 
-            <svg className="absolute inset-0 w-full h-full z-20" viewBox="0 0 794 1123" style={{ pointerEvents: "none" }}>
+            <svg className="absolute inset-0 w-full h-full z-20" viewBox={`0 0 ${paper.w} ${paper.h}`} style={{ pointerEvents: "none" }}>
               {areas.map((area) => {
                 if (!area.visible || !area.shape) return null;
                 return (
@@ -1932,17 +2127,18 @@ function DrawCanvas({
                     color={area.color}
                     label={area.name}
                     selected={area.id === selectedId}
+                    paper={paper}
                   />
                 );
               })}
               {liveBox && selectedArea && (
-                <ShapeOverlay shape={liveBox} color={selectedArea.color} label="" selected={false} preview />
+                <ShapeOverlay shape={liveBox} color={selectedArea.color} label="" selected={false} paper={paper} preview />
               )}
 
               {/* Freehand polygon in-progress preview */}
               {freehandActive && polygonPoints.length > 1 && selectedArea && (
                 <polyline
-                  points={polygonPoints.map(([x, y]) => `${x * 794},${y * 1123}`).join(" ")}
+                  points={polygonPoints.map(([x, y]) => `${x * paper.w},${y * paper.h}`).join(" ")}
                   fill="none"
                   stroke={selectedArea.color}
                   strokeWidth={2}
@@ -1980,6 +2176,7 @@ function DrawCanvas({
       <ReferenceUploadModal
         recordingId={recording.id}
         segmentId={segmentId}
+        orientationMode={orientationMode}
         onClose={() => setShowUpload(false)}
         onConfirmed={onReferenceConfirmed}
       />
@@ -1990,13 +2187,73 @@ function DrawCanvas({
 
 // ─── Shared sub-components ────────────────────────────────────────────────────
 
+/**
+ * Portrait / landscape switch for the printed sheet.
+ *
+ * The warp always maps the four marker corners onto the full canvas, so a
+ * landscape sheet squeezed into the portrait canvas is what the wrong setting
+ * looks like. Switching re-warps the backgrounds that can be re-warped.
+ */
+function OrientationToggle({
+  value, resolved, onChange,
+}: {
+  /** What the warp is asked for. */
+  value: OrientationMode;
+  /** What it came out as — the same thing unless `value` is "auto". */
+  resolved: PaperOrientation;
+  onChange: (m: OrientationMode) => Promise<void> | void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const pick = async (m: OrientationMode) => {
+    if (busy || (m === value && m !== "auto")) return;
+    setBusy(true);
+    try { await onChange(m); } finally { setBusy(false); }
+  };
+
+  const sheet = (w: number, h: number) => (
+    <span className="border border-current rounded-[2px]" style={{ width: w, height: h }} />
+  );
+
+  const option = (m: OrientationMode, label: string, icon: ReactNode, title: string) => (
+    <button
+      onClick={() => pick(m)}
+      disabled={busy}
+      title={title}
+      className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded transition-colors cursor-pointer
+                  disabled:cursor-wait
+        ${value === m ? "bg-zinc-700 text-white" : "text-zinc-400 hover:text-white"}`}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-zinc-900 border border-zinc-800"
+         title="How the printed sheet is laid out">
+      {busy && <Loader2 className="w-3 h-3 animate-spin text-zinc-500 ml-1" />}
+      {option(
+        "auto",
+        resolved === "landscape" ? "Auto · landscape" : "Auto · portrait",
+        resolved === "landscape" ? sheet(11, 8) : sheet(8, 11),
+        "Read the layout off the detected markers",
+      )}
+      {option("portrait", "Portrait", sheet(8, 11), "Force a portrait sheet")}
+      {option("landscape", "Landscape", sheet(11, 8), "Force a landscape sheet")}
+    </div>
+  );
+}
+
 function ShapeOverlay({
-  shape, color, label, selected, preview = false,
+  shape, color, label, selected, paper, preview = false,
 }: {
   shape: AoiShape;
   color: string;
   label: string;
   selected: boolean;
+  /** Pixel size of the svg viewBox the normalized shape is drawn into. */
+  paper: PaperSize;
   preview?: boolean;
 }) {
   const { kind, x, y, w, h } = shape;
@@ -2004,7 +2261,7 @@ function ShapeOverlay({
   const stroke = { stroke: color, strokeWidth: selected ? 2.5 : 1.5, strokeDasharray: preview ? "5 3" : undefined };
 
   if (kind === "polygon" && shape.points) {
-    const pts = shape.points.map(([px, py]) => `${px * 794},${py * 1123}`).join(" ");
+    const pts = shape.points.map(([px, py]) => `${px * paper.w},${py * paper.h}`).join(" ");
     const n = shape.points.length;
     const lcx = shape.points.reduce((s, [px]) => s + px, 0) / n * 100;
     const lcy = shape.points.reduce((s, [, py]) => s + py, 0) / n * 100;

@@ -9,15 +9,13 @@ import { tourAnchor } from "@/lib/tour/anchors";
 import { isDemoRecording } from "@/lib/tour/demo";
 import { applyMat, nearestIndex, unitSquareToQuad, type Mat3 } from "@/lib/sceneAnchor";
 import { drawGazeRing } from "@/lib/gazeMarker";
+import { asOrientation, paperSize, PORTRAIT_SIZE, type PaperOrientation, type PaperSize } from "@/lib/paper";
 import { makeLens, type Lens } from "@/lib/lensDistortion";
 import type {
   RecordingMeta, RecordingEvent, GazePrediction, SurfacePositionsData,
 } from "@/types";
 
 import { API_BASE as API } from "@/lib/apiBase";
-
-const PAPER_W = 794;
-const PAPER_H = 1123;
 
 // Gaze cursor radius, fixed in A4 canvas pixels. The video's radius is DERIVED
 // from this one through the frame's surface homography, so the ring covers the
@@ -60,6 +58,7 @@ interface AoiStateResponse {
   video_warped_image_b64?: string | null;    // warp of the picked scene frame
   reference_image_b64?: string | null;       // warp of an uploaded reference scan
   using_reference?: boolean;
+  orientation?: string | null;               // how the printed sheet is laid out
 }
 
 /** Which warp is painted behind the AoI shapes on the A4 canvas. */
@@ -126,7 +125,9 @@ function drawBg(
   ctx: CanvasRenderingContext2D,
   img: HTMLImageElement | null,
   areas: AoiArea[],
+  paper: PaperSize,
 ) {
+  const { w: PAPER_W, h: PAPER_H } = paper;
   ctx.clearRect(0, 0, PAPER_W, PAPER_H);
   if (img) {
     ctx.drawImage(img, 0, 0, PAPER_W, PAPER_H);
@@ -172,11 +173,11 @@ function drawBg(
  * distorted back to raw sensor pixels before the distance is taken; that is the
  * space the overlay is drawn in.
  */
-function ringRadiusInScenePx(H: Mat3, lens: Lens, u: number, v: number): number {
+function ringRadiusInScenePx(H: Mat3, lens: Lens, u: number, v: number, paper: PaperSize): number {
   const at = (a: number, b: number): [number, number] => lens.distort(...applyMat(H, a, b));
   const [x0, y0] = at(u, v);
-  const [xu, yu] = at(u + RING_R_PAPER / PAPER_W, v);
-  const [xv, yv] = at(u, v + RING_R_PAPER / PAPER_H);
+  const [xu, yu] = at(u + RING_R_PAPER / paper.w, v);
+  const [xv, yv] = at(u, v + RING_R_PAPER / paper.h);
   const du = Math.hypot(xu - x0, yu - y0);
   const dv = Math.hypot(xv - x0, yv - y0);
   return (du + dv) / 2;
@@ -216,6 +217,13 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
   // Which of the segment's two warps is painted behind the AoI shapes, and which
   // of them this segment actually has (the button only appears with both).
   const [bgMode, setBgMode] = useState<BgMode>("video");
+  // How the annotated sheet is laid out. The canvas and every normalized→pixel
+  // conversion follow it; the imperative draws read the ref, the JSX the state.
+  const [orientation, setOrientation] = useState<PaperOrientation>("portrait");
+  const paperRef = useRef<PaperSize>(PORTRAIT_SIZE);
+  /** What the AoI state says, used while no background has been decoded yet. */
+  const storedOrientationRef = useRef<PaperOrientation>("portrait");
+  const paper = paperSize(orientation);
   const [bgAvailable, setBgAvailable] = useState<{ video: boolean; reference: boolean }>(
     { video: false, reference: false },
   );
@@ -276,6 +284,10 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
   const lastDrawnRef = useRef(-1);   // playback position of the last painted frame
   const dirtyRef = useRef(true);     // forces a repaint when data, not time, changed
 
+  // Re-sizing the visible canvas for a new orientation clears it, so ask for a
+  // repaint once React has applied the new width/height.
+  useEffect(() => { dirtyRef.current = true; }, [orientation]);
+
   // Segment the playhead was last inside; null forces the first check to apply
   const timeSegRef = useRef<string | null>(null);
 
@@ -318,6 +330,8 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
         `/api/recordings/${recId}/aoi/${segId}/state`,
       );
       aoiAreasRef.current = state.areas ?? [];
+      storedOrientationRef.current = asOrientation(state.orientation);
+      applyOrientation(storedOrientationRef.current);
       const active = state.warped_image_b64 ?? null;
       // States saved before the editor kept the two warps apart carry only the
       // active one; `using_reference` says which of the two that is.
@@ -504,15 +518,30 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
 
   // ─── Drawing ───────────────────────────────────────────────────────────────
 
+  /** Point both the imperative draws (ref) and the JSX (state) at one geometry. */
+  function applyOrientation(o: PaperOrientation) {
+    paperRef.current = paperSize(o);
+    setOrientation(o);
+  }
+
   // Rebuild the offscreen background (paper + AoI areas) into bgCanvasRef
   function rebuildBgCanvas() {
-    if (!bgCanvasRef.current) {
-      bgCanvasRef.current = document.createElement("canvas");
-      bgCanvasRef.current.width = PAPER_W;
-      bgCanvasRef.current.height = PAPER_H;
-    }
+    if (!bgCanvasRef.current) bgCanvasRef.current = document.createElement("canvas");
+    // The decoded background is the ground truth: it was warped into a canvas of
+    // one orientation, and drawing it at the other squeezes the page. The stored
+    // flag only has to answer for a segment that has no background yet.
+    const img = paperImgsRef.current[bgModeRef.current];
+    applyOrientation(
+      img && img.naturalWidth && img.naturalHeight
+        ? (img.naturalWidth > img.naturalHeight ? "landscape" : "portrait")
+        : storedOrientationRef.current,
+    );
+    const { w, h } = paperRef.current;
+    // Assigning the size clears the canvas, so only do it when it changed.
+    if (bgCanvasRef.current.width !== w) bgCanvasRef.current.width = w;
+    if (bgCanvasRef.current.height !== h) bgCanvasRef.current.height = h;
     const ctx = bgCanvasRef.current.getContext("2d");
-    if (ctx) drawBg(ctx, paperImgsRef.current[bgModeRef.current], aoiAreasRef.current);
+    if (ctx) drawBg(ctx, paperImgsRef.current[bgModeRef.current], aoiAreasRef.current, paperRef.current);
   }
 
   /** The scene frame shown at playback position `t`, or -1 without a .time file. */
@@ -551,7 +580,8 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
 
     ctx.drawImage(bg, 0, 0);
     if (sample && sample.paper_x !== null && sample.paper_y !== null) {
-      drawGazeRing(ctx, sample.paper_x * PAPER_W, sample.paper_y * PAPER_H, RING_R_PAPER);
+      const { w, h } = paperRef.current;
+      drawGazeRing(ctx, sample.paper_x * w, sample.paper_y * h, RING_R_PAPER);
     }
   }, []);
 
@@ -651,7 +681,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
       const u = sample.paper_x ?? 0.5;
       const v = sample.paper_y ?? 0.5;
       const rScene = H
-        ? ringRadiusInScenePx(H, lens, Math.min(1, Math.max(0, u)), Math.min(1, Math.max(0, v)))
+        ? ringRadiusInScenePx(H, lens, Math.min(1, Math.max(0, u)), Math.min(1, Math.max(0, v)), paperRef.current)
         : RING_R_SCENE_FALLBACK;
       const [gx, gy] = toScreen(sample.pred_gaze_x, sample.pred_gaze_y);
       drawGazeRing(ctx, gx, gy, rScene * scale);
@@ -937,10 +967,16 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
               )}
             </div>
 
-            {/* Warped paper surface */}
+            {/* Warped paper surface.
+
+                The canvas sizes itself: its width/height attributes give it an
+                intrinsic ratio, and capping both axes lets it fit whichever way
+                round the sheet is. Putting the ratio on the box instead would not
+                survive the width cap — with an explicit height, a clamped width
+                leaves the box portrait and stretches a landscape sheet into it. */}
             <div
-              className="relative shrink-0 flex items-center justify-center"
-              style={{ aspectRatio: `${PAPER_W}/${PAPER_H}`, height: "100%", maxWidth: "45%" }}
+              className="relative shrink-0 h-full flex items-center justify-center"
+              style={{ maxWidth: "45%" }}
               {...tourAnchor("surface.paper")}
             >
               {loading ? (
@@ -949,8 +985,13 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
                   Loading…
                 </div>
               ) : (
-                <div className="relative h-full border border-zinc-700 rounded shadow-2xl">
-                  <canvas ref={canvasRef} width={PAPER_W} height={PAPER_H} className="w-full h-full rounded" />
+                <>
+                  <canvas
+                    ref={canvasRef}
+                    width={paper.w}
+                    height={paper.h}
+                    className="block max-h-full max-w-full rounded border border-zinc-700 shadow-2xl"
+                  />
                   {!hasGaze && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                       <div className="bg-zinc-900/90 rounded-lg px-5 py-4 text-center border border-zinc-700">
@@ -960,7 +1001,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
                       </div>
                     </div>
                   )}
-                </div>
+                </>
               )}
             </div>
           </div>
