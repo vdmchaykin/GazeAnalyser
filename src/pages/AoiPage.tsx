@@ -13,6 +13,7 @@ import { RecordingPicker } from "@/components/picker/RecordingPicker";
 import { tourAnchor } from "@/lib/tour/anchors";
 import { emitTourEvent } from "@/lib/tour/events";
 import type { ProjectRef, RecordingMeta, RecordingEvent } from "@/types";
+import { seekVideo, targetTime } from "@/lib/seekVideo";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -952,8 +953,8 @@ function FramePicker({
       const v = videoRef.current;
       if (!v) return;
       if (e.code === "Space") { e.preventDefault(); v.paused ? v.play() : v.pause(); }
-      else if (e.code === "ArrowRight") { e.preventDefault(); v.currentTime = Math.min(v.currentTime + 1, v.duration); }
-      else if (e.code === "ArrowLeft")  { e.preventDefault(); v.currentTime = Math.max(v.currentTime - 1, 0); }
+      else if (e.code === "ArrowRight") { e.preventDefault(); seekVideo(v, Math.min(targetTime(v) + 1, v.duration)); }
+      else if (e.code === "ArrowLeft")  { e.preventDefault(); seekVideo(v, Math.max(targetTime(v) - 1, 0)); }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -963,7 +964,7 @@ function FramePicker({
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const t = parseFloat(e.target.value);
-    if (videoRef.current) videoRef.current.currentTime = t;
+    if (videoRef.current) seekVideo(videoRef.current, t);
     setCurrentTime(t);
   };
 

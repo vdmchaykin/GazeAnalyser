@@ -60,6 +60,7 @@ export type AnchorId =
   | "gaze.stepCalibrate"
   | "gaze.stepMap"
   | "gaze.stepFixations"
+  | "gaze.stepValidate"
   | "gaze.detectConfig"
   | "gaze.detectPreview"
   | "gaze.detectStatus"

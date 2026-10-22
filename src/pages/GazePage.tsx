@@ -6,6 +6,7 @@ import { GazeDetectStep } from "@/components/gaze/GazeDetectStep";
 import { GazeCalibrateStep } from "@/components/gaze/GazeCalibrateStep";
 import { GazeMapStep } from "@/components/gaze/GazeMapStep";
 import { GazeFixationStep } from "@/components/gaze/GazeFixationStep";
+import { GazeValidateStep } from "@/components/gaze/GazeValidateStep";
 import { GazeSourceSelector } from "@/components/gaze/GazeSourceSelector";
 import { RecordingPickerScreen } from "@/components/picker/RecordingPicker";
 import { tourAnchor, type AnchorId } from "@/lib/tour/anchors";
@@ -16,6 +17,7 @@ const STEP_LABELS: Record<GazeStep, string> = {
   calibrate: "Calibrate",
   map: "Map",
   fixations: "Fixations",
+  validate: "Validate",
 };
 
 // Which analysis-state flag marks a step complete.
@@ -24,11 +26,12 @@ const STEP_DONE_FLAG: Record<GazeStep, keyof GazeAnalysisState> = {
   calibrate: "calibration_done",
   map: "mapping_done",
   fixations: "fixations_done",
+  validate: "validation_done",
 };
 
 // Step numbers stay tied to the full pipeline, so "Step 3 — Gaze Mapping" means
 // the same thing whichever source is selected.
-const STEP_ORDER: GazeStep[] = ["detect", "calibrate", "map", "fixations"];
+const STEP_ORDER: GazeStep[] = ["detect", "calibrate", "map", "fixations", "validate"];
 
 // Tour hooks on the step indicator — the tour drives the wizard through these.
 const STEP_ANCHORS: Record<GazeStep, AnchorId> = {
@@ -36,6 +39,7 @@ const STEP_ANCHORS: Record<GazeStep, AnchorId> = {
   calibrate: "gaze.stepCalibrate",
   map: "gaze.stepMap",
   fixations: "gaze.stepFixations",
+  validate: "gaze.stepValidate",
 };
 const stepNumber = (id: GazeStep) => STEP_ORDER.indexOf(id) + 1;
 
@@ -46,6 +50,7 @@ const EMPTY_STATE: GazeAnalysisState = {
   calibration_done: false,
   mapping_done: false,
   fixations_done: false,
+  validation_done: false,
   blinks_done: false,
   cloud_gaze_done: false,
   cloud_fixations_done: false,
@@ -251,6 +256,13 @@ export function GazePage({ onOpenPlayer, initialRecording }: { onOpenPlayer: (id
             done={analysisState.fixations_done}
             onDone={() => setAnalysisState((s) => ({ ...s, fixations_done: true }))}
             onDeleted={applyState}
+          />
+        )}
+        {!stateLoading && step === "validate" && (
+          <GazeValidateStep
+            recording={selected}
+            targetsDone={analysisState.validation_done}
+            onStateChange={applyState}
           />
         )}
       </div>

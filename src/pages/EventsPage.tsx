@@ -11,6 +11,7 @@ import { isDemoRecording } from "@/lib/tour/demo";
 import type { RecordingMeta, RecordingEvent } from "@/types";
 
 import { API_BASE as API } from "@/lib/apiBase";
+import { seekVideo, targetTime } from "@/lib/seekVideo";
 
 // ─── TMT sequence generators ──────────────────────────────────────────────────
 
@@ -106,7 +107,7 @@ function InlinePlayer({
   };
 
   const handleSeek = (t: number) => {
-    if (playerRef.current) playerRef.current.currentTime = t;
+    if (playerRef.current) seekVideo(playerRef.current, t);
     setCurrentTime(t);
   };
 
@@ -136,8 +137,8 @@ function InlinePlayer({
       const v = playerRef.current;
       if (!v) return;
       if (e.code === "Space") { e.preventDefault(); if (v.paused) v.play(); else v.pause(); }
-      else if (e.code === "ArrowRight") { e.preventDefault(); v.currentTime = Math.min(v.currentTime + 1, v.duration); }
-      else if (e.code === "ArrowLeft") { e.preventDefault(); v.currentTime = Math.max(v.currentTime - 1, 0); }
+      else if (e.code === "ArrowRight") { e.preventDefault(); seekVideo(v, Math.min(targetTime(v) + 1, v.duration)); }
+      else if (e.code === "ArrowLeft") { e.preventDefault(); seekVideo(v, Math.max(targetTime(v) - 1, 0)); }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -546,7 +547,7 @@ export function EventsPage({ initialRecording }: { initialRecording?: RecordingM
 
   const handleSeekTo = (t: number) => {
     if (videoRef.current) {
-      videoRef.current.currentTime = t;
+      seekVideo(videoRef.current, t);
       setCurrentTime(t);
     }
   };

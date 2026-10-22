@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from app.database import init_db
 from app.paths import DATA_DIR, ensure_dirs
-from app.api.routes import recordings, projects, gaze, events, aoi, export, motion
+from app.api.routes import recordings, projects, gaze, events, aoi, export, motion, validation
 
 
 @asynccontextmanager
@@ -36,6 +36,7 @@ app.include_router(aoi.router)
 app.include_router(aoi.project_router)
 app.include_router(export.router)
 app.include_router(motion.router)
+app.include_router(validation.router)
 
 
 @app.get("/api/health")

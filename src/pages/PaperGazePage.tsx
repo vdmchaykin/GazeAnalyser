@@ -15,6 +15,7 @@ import type {
 } from "@/types";
 
 import { API_BASE as API } from "@/lib/apiBase";
+import { seekVideo } from "@/lib/seekVideo";
 
 const PAPER_W = 794;
 const PAPER_H = 1123;
@@ -712,12 +713,12 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
 
   const syncEye = (t: number) => {
     const e = eyeVideoRef.current;
-    if (e && Number.isFinite(t)) e.currentTime = t;
+    if (e && Number.isFinite(t)) seekVideo(e, t);
   };
 
   const handleSeek = (t: number) => {
     const v = videoRef.current;
-    if (v) v.currentTime = t;
+    if (v) seekVideo(v, t);
     syncEye(t);
     setCurrentTime(t);
     dirtyRef.current = true;
@@ -728,7 +729,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
     const e = eyeVideoRef.current;
     if (!v) return;
     if (v.paused) {
-      if (v.duration && v.currentTime >= v.duration - 0.01) { v.currentTime = 0; syncEye(0); }
+      if (v.duration && v.currentTime >= v.duration - 0.01) { seekVideo(v, 0); syncEye(0); }
       v.play().catch(() => { /* autoplay policies: the click itself is the gesture */ });
       e?.play().catch(() => {});
     } else {
@@ -739,7 +740,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
 
   const handleReset = () => {
     const v = videoRef.current;
-    if (v) { v.pause(); v.currentTime = 0; }
+    if (v) { v.pause(); seekVideo(v, 0); }
     syncEye(0);
     eyeVideoRef.current?.pause();
     setCurrentTime(0);
@@ -757,7 +758,7 @@ export function PaperGazePage({ initialRecording }: { initialRecording?: Recordi
     const e = eyeVideoRef.current;
     const v = videoRef.current;
     if (!e || !v || !showEye) return;
-    e.currentTime = v.currentTime;
+    seekVideo(e, v.currentTime);
     e.playbackRate = playbackSpeed;
     if (!v.paused) e.play().catch(() => {});
   }, [showEye, playbackSpeed]);

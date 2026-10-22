@@ -15,6 +15,7 @@ import { SceneAnchorPanel, type AnchorStats } from "@/components/anchor/SceneAnc
 const SCANPATH_WINDOW_S = 3;
 
 import { API_BASE as API } from "@/lib/apiBase";
+import { seekVideo } from "@/lib/seekVideo";
 
 interface VideoPlayerProps {
   recordingId: string;
@@ -146,7 +147,7 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
 
   // Sync scene → eye on seek
   const syncEye = useCallback((time: number) => {
-    if (eyeRef.current) eyeRef.current.currentTime = time;
+    if (eyeRef.current) seekVideo(eyeRef.current, time);
   }, []);
 
   const togglePlay = () => {
@@ -159,7 +160,7 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const t = parseFloat(e.target.value);
-    if (sceneRef.current) sceneRef.current.currentTime = t;
+    if (sceneRef.current) seekVideo(sceneRef.current, t);
     syncEye(t);
     setCurrentTime(t);
   };
@@ -199,7 +200,7 @@ export function VideoPlayer({ recordingId, hasEyeVideo }: VideoPlayerProps) {
     const e = eyeRef.current;
     const v = sceneRef.current;
     if (!e || !v || !showEye) return;
-    e.currentTime = v.currentTime;
+    seekVideo(e, v.currentTime);
     e.playbackRate = speed;
     if (!v.paused) e.play();
   }, [showEye]);

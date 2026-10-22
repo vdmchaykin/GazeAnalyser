@@ -26,6 +26,7 @@ from app.api.routes.aoi import (
     _APRILTAG_AVAILABLE,
     _BULK_QUAD_DECIMATE,
     _BULK_NTHREADS,
+    MAX_CONSECUTIVE_READ_FAILURES,
     GAZE_SOURCES,
     CLOUD_SOURCES,
     active_source,
@@ -84,6 +85,9 @@ def _gaze_state_dict(folder_path: str, source: str) -> dict:
         "calibration_done": calibration_done,
         "mapping_done": (gdir / "gaze_predictions.csv").exists(),
         "fixations_done": (gdir / "fixations.csv").exists(),
+        # Validation targets belong to the recording, not a source: one set of
+        # them validates every source (see validation.py).
+        "validation_done": (_gaze_dir(folder_path) / "validation_points.json").exists(),
         # Pupil Cloud's own exports — shipped with the recording, not produced by
         # any of our stages, so they are available independently of them.
         "cloud_gaze_done": _cloud_gaze_path(folder_path).exists(),
@@ -1285,6 +1289,67 @@ class CalibrationSaveRequest(BaseModel):
     points: list[dict]
 
 
+# ── scene / eye video timing ───────────────────────────────────────────────
+# Both mp4s start at PTS 0, but the cameras do not start together: the eye camera
+# starts 0.6–0.9 s after the scene camera on most recordings (0.56 s BEFORE it on
+# 130c8c42). Played at the same currentTime they show two different moments, so
+# every view that shows both has to offset the eye video by `eye_offset_s`.
+
+def _timeline_t0(folder_path: str) -> Optional[int]:
+    """First eye-camera timestamp from csv/timestamps.csv — the origin the legacy
+    calibration convention counts video seconds from (see `_scene_grid`)."""
+    import csv as csv_mod
+    f = Path(folder_path) / "csv" / "timestamps.csv"
+    if not f.exists():
+        return None
+    with open(f) as fh:
+        reader = csv_mod.reader(fh)
+        header = next(reader, None)
+        row = next(reader, None)
+    if not header or not row:
+        return None
+    col = next((i for i, c in enumerate(header) if "timestamp" in c.lower()), 0)
+    try:
+        return int(row[col])
+    except (ValueError, IndexError):
+        return None
+
+
+def _first_ts(video_path: Optional[str]) -> Optional[int]:
+    if not video_path:
+        return None
+    ts = _load_scene_timestamps(video_path)
+    return int(ts[0]) if ts.size else None
+
+
+def video_timeline(rec: dict) -> dict:
+    """Absolute start of each video, and how much later the eye video starts."""
+    eye0 = _first_ts(rec.get("eye_video")) or _timeline_t0(rec["folder_path"])
+    scene0 = _first_ts(rec.get("scene_video")) or eye0
+    offset = (eye0 - scene0) / 1e9 if (eye0 is not None and scene0 is not None) else 0.0
+    return {"scene0_ns": scene0, "eye0_ns": eye0, "eye_offset_s": offset}
+
+
+def mark_abs_ns(scene_ts: np.ndarray, t0: int, point: dict) -> int:
+    """Absolute device timestamp of a point marked in the calibration UI.
+
+    ``timestamp_ns`` is always the scene video position (seconds × 1e9). Points
+    marked with the eye video synchronised to the scene (``time_base`` =
+    "scene_video") name the scene frame shown there. Older points were marked with
+    both videos at the same currentTime, judged by the eye video, and keep the
+    convention they were fitted with: the eye timeline's start plus that position."""
+    if point.get("time_base") == "scene_video" and scene_ts.size:
+        t = int(scene_ts[0]) + int(point["timestamp_ns"])
+        return int(scene_ts[_nearest_frame(scene_ts, t)])
+    return t0 + int(point["timestamp_ns"])
+
+
+@router.get("/video-sync")
+async def get_video_sync(recording_id: str):
+    rec = await _get_recording(recording_id)
+    return video_timeline(rec)
+
+
 @router.post("/calibration")
 async def save_calibration(recording_id: str, req: CalibrationSaveRequest):
     rec = await _get_recording(recording_id)
@@ -1559,15 +1624,14 @@ async def map_gaze(recording_id: str, source: Optional[str] = None, resample_30f
     if not calib_points:
         raise HTTPException(status_code=400, detail="No calibration points")
 
-    # Frontend saves timestamp_ns = seekTime * 1e9 (seconds from scene video start).
-    # Scene and eye cameras are hardware-synced on Neon: both cover [t0, t1], so a
-    # calibration point at seekTime maps to absolute timestamp t0 + seekTime_ns.
+    # Frontend saves timestamp_ns = seekTime * 1e9 (seconds from scene video start);
+    # `mark_abs_ns` turns that into the device timestamp of the marked moment.
     # Aggregate the pupil over the whole fixation plateau (not one frame) to cut
     # noise, bounded so a plateau can never reach into the neighbouring target.
-    ts_marks = [t0 + cp["timestamp_ns"] for cp in calib_points]
+    scene_ts = _load_scene_timestamps(rec["scene_video"]) if rec.get("scene_video") else np.array([], dtype=np.int64)
+    ts_marks = [mark_abs_ns(scene_ts, t0, cp) for cp in calib_points]
     merged_rows = []
-    for cp, (lo_ns, hi_ns) in zip(calib_points, _plateau_bounds(ts_marks)):
-        ts = t0 + cp["timestamp_ns"]
+    for cp, ts, (lo_ns, hi_ns) in zip(calib_points, ts_marks, _plateau_bounds(ts_marks)):
         feats = _aggregate_dwell(pupils_valid, ts, all_features, lo_ns, hi_ns)
         merged_rows.append({
             "point_id": cp["point_id"],
@@ -2384,11 +2448,22 @@ def _build_homographies(scene_path: str, registry: Optional[dict],
 
     detector = TagDetector(_BULK_QUAD_DECIMATE, _BULK_NTHREADS)
     cap = cv2.VideoCapture(scene_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or len(scene_ts)
     frame_idx = 0
-    while True:
+    misses = 0
+    while not (total and frame_idx >= total):
         ok, frame = cap.read()
         if not ok:
-            break
+            # An undecodable frame, not the end of the file (see
+            # MAX_CONSECUTIVE_READ_FAILURES) — 46ace979 has one at frame 702, and
+            # stopping there left the page unmapped for the rest of the recording.
+            # Skip it as unlocalized so frame_idx keeps meaning scene frame index.
+            misses += 1
+            if misses > MAX_CONSECUTIVE_READ_FAILURES:
+                break
+            frame_idx += 1
+            continue
+        misses = 0
         dets = detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         H = _scene_to_paper_H(dets, registry, folder_path)
         if H is not None:

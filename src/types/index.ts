@@ -24,7 +24,7 @@ export interface Project {
   recording_count: number;
 }
 
-export type GazeStep = "detect" | "calibrate" | "map" | "fixations";
+export type GazeStep = "detect" | "calibrate" | "map" | "fixations" | "validate";
 
 /**
  * Which gaze a recording is analysed from. Each source keeps its own copy of the
@@ -43,9 +43,9 @@ export const GAZE_SOURCE_LABELS: Record<GazeSource, string> = {
 
 /** Steps a source actually runs — the cloud ones ship gaze instead of deriving it. */
 export const GAZE_SOURCE_STEPS: Record<GazeSource, GazeStep[]> = {
-  own: ["detect", "calibrate", "map", "fixations"],
-  cloud: ["map", "fixations"],
-  cloud_native: ["map", "fixations"],
+  own: ["detect", "calibrate", "map", "fixations", "validate"],
+  cloud: ["map", "fixations", "validate"],
+  cloud_native: ["map", "fixations", "validate"],
 };
 
 export interface GazeJobStatus {
@@ -57,9 +57,13 @@ export interface GazeJobStatus {
 
 export interface CalibrationPoint {
   point_id: number;
+  /** Scene video position × 1e9. */
   timestamp_ns: number;
   gaze_x: number;
   gaze_y: number;
+  /** "scene_video": marked with the eye video synced to the scene. Absent on
+   *  points marked before that — they resolve by the older convention. */
+  time_base?: "scene_video";
 }
 
 export interface GazePrediction {
@@ -104,6 +108,8 @@ export interface GazeAnalysisState {
   calibration_done: boolean;
   mapping_done: boolean;
   fixations_done: boolean;
+  /** Validation targets are marked — shared by every source of the recording. */
+  validation_done: boolean;
   blinks_done: boolean;
   cloud_gaze_done: boolean;
   cloud_fixations_done: boolean;

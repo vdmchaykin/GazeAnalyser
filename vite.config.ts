@@ -31,8 +31,10 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri`, and the Python backend —
+      //    its venv and PyInstaller bundle (torch) hold ~45k files, enough to
+      //    exhaust the inotify watch limit (ENOSPC) on Linux
+      ignored: ["**/src-tauri/**", "**/backend/**"],
     },
   },
 }));

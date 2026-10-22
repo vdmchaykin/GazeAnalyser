@@ -3,11 +3,55 @@ import { CheckCircle2, Pause, Play, Trash2, Undo2 } from "lucide-react";
 import { confirmDialog } from "@/components/ConfirmDialog";
 import { SceneAnchorPanel, type AnchorStats } from "@/components/anchor/SceneAnchorPanel";
 import { useSceneAnchor, type AnchorMode } from "@/lib/useSceneAnchor";
-import { tourAnchor } from "@/lib/tour/anchors";
+import { useContainSize } from "@/lib/useContainSize";
+import { useEyeSync } from "@/lib/useEyeSync";
+import { tourAnchor, type AnchorId } from "@/lib/tour/anchors";
 import type { CalibrationPoint, GazeAnalysisState, RecordingMeta } from "@/types";
 
 import { API_BASE as API } from "@/lib/apiBase";
+import { seekVideo } from "@/lib/seekVideo";
 const TOTAL_POINTS = 9;
+
+// The same marking UI serves two purposes. Calibration points train the gaze
+// model; validation targets are marked at OTHER moments and only measure it, so
+// they are drawn in a different colour and stored apart from the calibration.
+export type PointKind = "calibration" | "validation";
+
+const KIND: Record<PointKind, {
+  endpoint: string;
+  deleteEndpoint: string;
+  listTitle: string;
+  savedLabel: string;
+  deleteTitle: string;
+  deleteMessage: string;
+  rgb: string;
+  stroke: string;
+  tour: boolean;
+}> = {
+  calibration: {
+    endpoint: "gaze/calibration",
+    deleteEndpoint: "gaze/data/calibration",
+    listTitle: "Calibration Points",
+    savedLabel: "Calibration saved",
+    deleteTitle: "Delete calibration",
+    deleteMessage: "Delete saved calibration? This also clears the gaze mapping for this recording.",
+    rgb: "34, 197, 94",
+    stroke: "#22c55e",
+    tour: true,
+  },
+  validation: {
+    endpoint: "gaze/validation/free",
+    deleteEndpoint: "gaze/validation/free",
+    listTitle: "Validation Targets",
+    savedLabel: "Validation targets saved",
+    deleteTitle: "Delete clicked targets",
+    deleteMessage: "Delete the clicked validation targets for this recording? Metric-sheet marks are kept.",
+    rgb: "245, 158, 11",
+    stroke: "#f59e0b",
+    // The guided tour walks the calibration step only.
+    tour: false,
+  },
+};
 
 interface Props {
   recording: RecordingMeta;
@@ -15,9 +59,12 @@ interface Props {
   done: boolean;
   onDone: (points: CalibrationPoint[]) => void;
   onDeleted: (state: GazeAnalysisState) => void;
+  kind?: PointKind;
 }
 
-export function GazeCalibrateStep({ recording, existingPoints, done: initialDone, onDone, onDeleted }: Props) {
+export function GazeCalibrateStep({ recording, existingPoints, done: initialDone, onDone, onDeleted, kind = "calibration" }: Props) {
+  const cfg = KIND[kind];
+  const anchor = (id: AnchorId) => (cfg.tour ? tourAnchor(id) : {});
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<HTMLVideoElement>(null);
@@ -35,6 +82,8 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
   const [speed, setSpeed] = useState(1);
   const [eyePos, setEyePos] = useState({ x: null as number | null, y: null as number | null });
   const [dragging, setDragging] = useState(false);
+  const videoBox = useContainSize(canvasContainerRef, naturalSize.w / naturalSize.h);
+  const syncEye = useEyeSync(recording.id, sceneRef, eyeRef, playing);
 
   // A calibration point is a scene-pixel position that is only true in the frame
   // it was clicked in. Drawn unchanged it sticks to the SCREEN, drifting off the
@@ -116,10 +165,10 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
       const anchored = mode !== "fixed";
       ctx.beginPath();
       ctx.arc(cx, cy, 8, 0, Math.PI * 2);
-      ctx.fillStyle = anchored ? "rgba(34, 197, 94, 0.4)" : "rgba(34, 197, 94, 0.12)";
+      ctx.fillStyle = anchored ? `rgba(${cfg.rgb}, 0.4)` : `rgba(${cfg.rgb}, 0.12)`;
       ctx.fill();
       ctx.setLineDash(anchored ? [] : [3, 3]);
-      ctx.strokeStyle = anchored ? "#22c55e" : "rgba(34, 197, 94, 0.5)";
+      ctx.strokeStyle = anchored ? cfg.stroke : `rgba(${cfg.rgb}, 0.5)`;
       ctx.lineWidth = 2;
       ctx.stroke();
       ctx.setLineDash([]);
@@ -130,7 +179,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
     anchorStatsRef.current = stats;
     // `inputsVersion` is not read here — it is in the dependency list so the
     // dots are redrawn once the anchoring files finish loading.
-  }, [points, naturalSize, anchorScene, duration, frameAt, makeTransport, inputsVersion]);
+  }, [points, naturalSize, anchorScene, duration, frameAt, makeTransport, inputsVersion, cfg]);
 
   // Redraw on any input change, and on every animation frame while the video is
   // running — the dots follow the camera, so they have to keep up with it.
@@ -148,8 +197,8 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
   }, [playing, drawCanvas]);
 
   const handleScrub = (t: number) => {
-    if (sceneRef.current) sceneRef.current.currentTime = t;
-    if (eyeRef.current) eyeRef.current.currentTime = t;
+    if (sceneRef.current) seekVideo(sceneRef.current, t);
+    syncEye();
     setSeekTime(t);
   };
 
@@ -161,12 +210,13 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
       v.pause();
       e?.pause();
     } else {
-      v.playbackRate = speed;
-      if (e) e.playbackRate = speed;
+      if (v.playbackRate !== speed) v.playbackRate = speed;
+      if (e && e.playbackRate !== speed) e.playbackRate = speed;
+      syncEye();
       v.play();
-      e?.play();
+      e?.play().catch(() => {});
     }
-  }, [playing, speed]);
+  }, [playing, speed, syncEye]);
 
   const handleSpeedChange = (s: number) => {
     setSpeed(s);
@@ -233,6 +283,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
       timestamp_ns: Math.round(clickTime * 1e9),
       gaze_x,
       gaze_y,
+      time_base: "scene_video",
     };
 
     setPoints((prev) => {
@@ -253,24 +304,27 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
   };
 
   const handleDelete = async () => {
-    if (!(await confirmDialog({ title: "Delete calibration", message: "Delete saved calibration? This also clears the gaze mapping for this recording." }))) return;
+    if (!(await confirmDialog({ title: cfg.deleteTitle, message: cfg.deleteMessage }))) return;
     try {
-      const res = await fetch(`${API}/api/recordings/${recording.id}/gaze/data/calibration`, { method: "DELETE" });
+      const res = await fetch(`${API}/api/recordings/${recording.id}/${cfg.deleteEndpoint}`, { method: "DELETE" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const state: GazeAnalysisState = await res.json();
+      // Deleting validation targets returns no analysis state, so it is re-read.
+      const state: GazeAnalysisState = kind === "calibration"
+        ? await res.json()
+        : await (await fetch(`${API}/api/recordings/${recording.id}/gaze/state`)).json();
       setPoints([]);
       setCurrentPointId(1);
       setDone(false);
       onDeleted(state);
     } catch (e) {
-      alert("Failed to delete calibration: " + String(e));
+      alert(`Failed to delete: ${String(e)}`);
     }
   };
 
   const handleSave = async () => {
     setSaving(true);
     try {
-      await fetch(`${API}/api/recordings/${recording.id}/gaze/calibration`, {
+      await fetch(`${API}/api/recordings/${recording.id}/${cfg.endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ points }),
@@ -278,7 +332,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
       setDone(true);
       onDone(points);
     } catch (e) {
-      alert("Failed to save calibration: " + String(e));
+      alert(`Failed to save: ${String(e)}`);
     } finally {
       setSaving(false);
     }
@@ -294,9 +348,9 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
     <div className="flex h-full">
       {/* Left panel — point list */}
       <div className="w-56 shrink-0 border-r border-zinc-800 flex flex-col"
-           {...tourAnchor("gaze.calibPoints")}>
+           {...anchor("gaze.calibPoints")}>
         <div className="px-4 py-3 border-b border-zinc-800">
-          <p className="text-xs font-medium text-white uppercase tracking-wider">Calibration Points</p>
+          <p className="text-xs font-medium text-white uppercase tracking-wider">{cfg.listTitle}</p>
         </div>
 
         <div className="flex-1 overflow-auto py-2">
@@ -379,16 +433,9 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
           onPointerMove={onEyePointerMove}
           onPointerUp={onEyePointerUp}
         >
-          {/* Aspect-ratio wrapper — video and canvas overlay are the same size */}
-          <div
-            className="relative"
-            style={{
-              aspectRatio: `${naturalSize.w} / ${naturalSize.h}`,
-              maxWidth: "100%",
-              maxHeight: "100%",
-              width: "100%",
-            }}
-          >
+          {/* Sized to the video's own aspect ratio, so the click canvas covers
+              exactly the video's pixels (see useContainSize) */}
+          <div className="relative" style={videoBox ?? { visibility: "hidden" }}>
             <video
               ref={sceneRef}
               src={`${API}/api/recordings/${recording.id}/video/scene`}
@@ -398,10 +445,10 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
               preload="metadata"
             />
             <canvas
-              {...tourAnchor("gaze.calibCanvas")}
+              {...anchor("gaze.calibCanvas")}
               ref={canvasRef}
               width={960}
-              height={540}
+              height={Math.round((960 * naturalSize.h) / naturalSize.w)}
               onClick={handleCanvasClick}
               className="absolute inset-0 w-full h-full cursor-crosshair"
             />
@@ -417,7 +464,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
             <div className="absolute top-3 left-3 flex items-center gap-2 bg-emerald-950/80
                             border border-emerald-700 text-emerald-300 text-xs px-3 py-1.5 rounded-lg"
                  style={{ zIndex: 20 }}>
-              <CheckCircle2 className="w-4 h-4" /> Calibration saved
+              <CheckCircle2 className="w-4 h-4" /> {cfg.savedLabel}
             </div>
           )}
 
@@ -454,7 +501,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
 
         {/* Controls */}
         <div className="border-t border-zinc-800 bg-zinc-900 px-4 py-3 space-y-2"
-             {...tourAnchor("gaze.calibControls")}>
+             {...anchor("gaze.calibControls")}>
           <div className="flex items-center gap-3">
             <button
               onClick={togglePlay}
@@ -495,7 +542,7 @@ export function GazeCalibrateStep({ recording, existingPoints, done: initialDone
                 {points.length} / {TOTAL_POINTS} points marked
               </span>
               <button
-                {...tourAnchor("gaze.calibSave")}
+                {...anchor("gaze.calibSave")}
                 onClick={handleSave}
                 disabled={points.length === 0 || saving}
                 className="flex items-center gap-2 px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500
