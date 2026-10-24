@@ -178,7 +178,7 @@ export function GazeMapStep({ recording, source, calibrationPoints, done: initia
 
           <div className="grid grid-cols-3 gap-4">
             {result.mean_rmse !== null ? (
-              <Stat label="Mean RMSE" value={`${result.mean_rmse.toFixed(1)} px`} />
+              <Stat label="Mean LOO error" value={`${result.mean_rmse.toFixed(1)} px`} />
             ) : (
               <Stat label="Gaze samples" value={String(result.total_frames)} />
             )}

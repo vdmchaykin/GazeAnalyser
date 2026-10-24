@@ -627,8 +627,9 @@ const gazeChapter: TourChapter = {
         "Fits a polynomial regression on the calibration pairs and predicts a gaze point for every " +
         "frame of the recording. Faster than detection, but still not instant.",
       outro:
-        "When it finishes you get the mean RMSE — the average residual in pixels. That number is " +
-        "your first sanity check: high RMSE usually means a mis-marked calibration point. " +
+        "When it finishes you get the mean LOO error — each calibration point predicted by a model " +
+        "fitted without it, averaged in pixels. That number is your first sanity check: a high " +
+        "LOO error usually means a mis-marked calibration point. " +
         "One ordering trap: mapping resolves page coordinates through the AoI surface as it runs, " +
         "so if you have not defined that surface yet, run it now and expect to repair the page " +
         "coordinates afterwards — the offset panel on the Visualise page does it without a " +
