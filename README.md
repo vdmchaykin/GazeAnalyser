@@ -19,7 +19,7 @@
 
 <br>
 
-<img src="docs/images/Surface_map.png" alt="Surface map: scene video with gaze and the rectified TMT sheet" width="100%">
+[Video_example.webm](https://github.com/user-attachments/assets/e0211ed8-8074-4251-9523-3b131efbb563)
 
 <sub><i>Surface map: the scene video with the localised sheet and gaze (left), the same moment on the rectified sheet with its AoIs (right).</i></sub>
 
