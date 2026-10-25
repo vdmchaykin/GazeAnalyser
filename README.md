@@ -4,7 +4,7 @@
 
 # 👁️ Gaze Analyser
 
-**An offline desktop application for Pupil Labs Neon recordings: pupil detection, gaze calibration, mapping onto paper stimuli, AoI analysis and Pupil-compatible export, all in one place**
+**An offline desktop application for Pupil Labs Neon recordings: pupil detection, gaze calibration, mapping onto paper stimuli, AoI analysis and Pupil-Labs-compatible export, all in one place**
 
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white&labelColor=333)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white&labelColor=333)](https://react.dev)
@@ -34,8 +34,7 @@
 ## 📌 Overview
 
 Pupil Labs Neon glasses record the eye cameras and the scene camera, but the
-analysis of paper-based tasks (where exactly on the sheet did the participant
-look, how long, in what order?) usually requires Pupil Cloud and several manual
+analysis of paper-based tasks usually requires Pupil Cloud and several manual
 tools. **Gaze Analyser** does the whole chain **locally**, on a native Neon
 recording:
 
